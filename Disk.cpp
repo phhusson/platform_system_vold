@@ -559,8 +559,8 @@ int Disk::getMaxMinors() {
         // Per Documentation/devices.txt this is dynamic
         std::string tmp;
         if (!ReadFileToString(kSysfsMmcMaxMinors, &tmp)) {
-            LOG(ERROR) << "Failed to read max minors";
-            return -errno;
+            LOG(ERROR) << "Failed to read max minors, assume 15";
+            return 15;
         }
         return atoi(tmp.c_str());
     }
