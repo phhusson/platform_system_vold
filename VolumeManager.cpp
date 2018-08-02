@@ -372,7 +372,7 @@ int VolumeManager::onUserRemoved(userid_t userId) {
     return 0;
 }
 
-int VolumeManager::onUserStarted(userid_t userId) {
+int VolumeManager::onUserStarted(userid_t userId, const std::vector<std::string>& packageNames) {
     // Note that sometimes the system will spin up processes from Zygote
     // before actually starting the user, so we're okay if Zygote
     // already created this directory.
@@ -380,6 +380,7 @@ int VolumeManager::onUserStarted(userid_t userId) {
     fs_prepare_dir(path.c_str(), 0755, AID_ROOT, AID_ROOT);
 
     mStartedUsers.insert(userId);
+    mUserPackages[userId] = packageNames;
     if (mPrimary) {
         linkPrimary(userId);
     }
@@ -393,11 +394,17 @@ int VolumeManager::onUserStopped(userid_t userId) {
 
 int VolumeManager::addAppIds(const std::vector<std::string>& packageNames,
         const std::vector<int32_t>& appIds) {
+    for (size_t i = 0; i < packageNames.size(); ++i) {
+        mAppIds[packageNames[i]] = appIds[i];
+    }
     return 0;
 }
 
 int VolumeManager::addSandboxIds(const std::vector<int32_t>& appIds,
         const std::vector<std::string>& sandboxIds) {
+    for (size_t i = 0; i < appIds.size(); ++i) {
+        mSandboxIds[appIds[i]] = sandboxIds[i];
+    }
     return 0;
 }
 
@@ -587,6 +594,10 @@ int VolumeManager::reset() {
     updateVirtualDisk();
     mAddedUsers.clear();
     mStartedUsers.clear();
+
+    mUserPackages.clear();
+    mAppIds.clear();
+    mSandboxIds.clear();
     return 0;
 }
 
