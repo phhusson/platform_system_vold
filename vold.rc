@@ -5,4 +5,3 @@ service vold /system/bin/vold \
     ioprio be 2
     writepid /dev/cpuset/foreground/tasks
     shutdown critical
-    group root reserved_disk
