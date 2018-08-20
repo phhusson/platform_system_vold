@@ -706,6 +706,8 @@ bool e4crypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
         auto media_ce_path = android::vold::BuildDataMediaCePath(volume_uuid, user_id);
         auto user_ce_path = android::vold::BuildDataUserCePath(volume_uuid, user_id);
 
+	prepare_dir(android::vold::BuildDataPath("") + "/vendor_ce", 0771, 0, 0);
+
         if (volume_uuid.empty()) {
             if (!prepare_dir(system_ce_path, 0770, AID_SYSTEM, AID_SYSTEM)) return false;
             if (!prepare_dir(misc_ce_path, 01771, AID_SYSTEM, AID_MISC)) return false;
