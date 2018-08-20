@@ -35,7 +35,7 @@ static const char* kFsckPath = "/system/bin/fsck.exfat";
 
 bool IsSupported() {
     return access(kMkfsPath, X_OK) == 0 && access(kFsckPath, X_OK) == 0 &&
-           IsFilesystemSupported("exfat");
+           (IsFilesystemSupported("exfat") || IsFilesystemSupported("sdfat"));
 }
 
 status_t Check(const std::string& source) {
@@ -60,13 +60,16 @@ status_t Mount(const std::string& source, const std::string& target, int ownerUi
     auto mountData = android::base::StringPrintf("uid=%d,gid=%d,fmask=%o,dmask=%o", ownerUid,
                                                  ownerGid, permMask, permMask);
 
-    if (mount(source.c_str(), target.c_str(), "exfat", mountFlags, mountData.c_str()) == 0) {
+    const char *fs = "exfat";
+    if(IsFilesystemSupported("sdfat"))
+        fs = "sdfat";
+    if (mount(source.c_str(), target.c_str(), fs, mountFlags, mountData.c_str()) == 0) {
         return 0;
     }
 
     PLOG(ERROR) << "Mount failed; attempting read-only";
     mountFlags |= MS_RDONLY;
-    if (mount(source.c_str(), target.c_str(), "exfat", mountFlags, mountData.c_str()) == 0) {
+    if (mount(source.c_str(), target.c_str(), fs, mountFlags, mountData.c_str()) == 0) {
         return 0;
     }
 
