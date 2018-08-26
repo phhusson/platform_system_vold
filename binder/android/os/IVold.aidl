@@ -96,6 +96,9 @@ interface IVold {
     void prepareUserStorage(@nullable @utf8InCpp String uuid, int userId, int userSerial, int storageFlags);
     void destroyUserStorage(@nullable @utf8InCpp String uuid, int userId, int storageFlags);
 
+    void mountExternalStorageForApp(in @utf8InCpp String packageName,
+            int appId, in @utf8InCpp String sandboxId, int userId);
+
     const int ENCRYPTION_FLAG_NO_UI = 4;
 
     const int ENCRYPTION_STATE_NONE = 1;
@@ -126,6 +129,7 @@ interface IVold {
     const int REMOUNT_MODE_DEFAULT = 1;
     const int REMOUNT_MODE_READ = 2;
     const int REMOUNT_MODE_WRITE = 3;
+    const int REMOUNT_MODE_FULL = 4;
 
     const int VOLUME_STATE_UNMOUNTED = 0;
     const int VOLUME_STATE_CHECKING = 1;
