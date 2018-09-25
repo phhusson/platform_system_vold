@@ -265,9 +265,9 @@ status_t ForkExecvp(const std::vector<std::string>& args, security_context_t con
     for (size_t i = 0; i < argc; i++) {
         argv[i] = (char*)args[i].c_str();
         if (i == 0) {
-            LOG(VERBOSE) << args[i];
+            LOG(DEBUG) << args[i];
         } else {
-            LOG(VERBOSE) << "    " << args[i];
+            LOG(DEBUG) << "    " << args[i];
         }
     }
 
@@ -300,9 +300,9 @@ status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::strin
     for (size_t i = 0; i < args.size(); i++) {
         cmd += args[i] + " ";
         if (i == 0) {
-            LOG(VERBOSE) << args[i];
+            LOG(DEBUG) << args[i];
         } else {
-            LOG(VERBOSE) << "    " << args[i];
+            LOG(DEBUG) << "    " << args[i];
         }
     }
     output.clear();
@@ -327,7 +327,7 @@ status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::strin
     }
     char line[1024];
     while (fgets(line, sizeof(line), fp) != nullptr) {
-        LOG(VERBOSE) << line;
+        LOG(DEBUG) << line;
         output.push_back(std::string(line));
     }
     if (pclose(fp) != 0) {
@@ -344,9 +344,9 @@ pid_t ForkExecvpAsync(const std::vector<std::string>& args) {
     for (size_t i = 0; i < argc; i++) {
         argv[i] = (char*)args[i].c_str();
         if (i == 0) {
-            LOG(VERBOSE) << args[i];
+            LOG(DEBUG) << args[i];
         } else {
-            LOG(VERBOSE) << "    " << args[i];
+            LOG(DEBUG) << "    " << args[i];
         }
     }
 
@@ -476,6 +476,42 @@ status_t NormalizeHex(const std::string& in, std::string& out) {
     return StrToHex(tmp, out);
 }
 
+status_t GetBlockDevSize(int fd, uint64_t* size) {
+    if (ioctl(fd, BLKGETSIZE64, size)) {
+        return -errno;
+    }
+
+    return OK;
+}
+
+status_t GetBlockDevSize(const std::string& path, uint64_t* size) {
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    status_t res = OK;
+
+    if (fd < 0) {
+        return -errno;
+    }
+
+    res = GetBlockDevSize(fd, size);
+
+    close(fd);
+
+    return res;
+}
+
+status_t GetBlockDev512Sectors(const std::string& path, uint64_t* nr_sec) {
+    uint64_t size;
+    status_t res = GetBlockDevSize(path, &size);
+
+    if (res != OK) {
+        return res;
+    }
+
+    *nr_sec = size / 512;
+
+    return OK;
+}
+
 uint64_t GetFreeBytes(const std::string& path) {
     struct statvfs sb;
     if (statvfs(path.c_str(), &sb) == 0) {
@@ -560,8 +596,7 @@ bool IsFilesystemSupported(const std::string& fsType) {
 status_t WipeBlockDevice(const std::string& path) {
     status_t res = -1;
     const char* c_path = path.c_str();
-    unsigned long nr_sec = 0;
-    unsigned long long range[2];
+    uint64_t range[2] = {0, 0};
 
     int fd = TEMP_FAILURE_RETRY(open(c_path, O_RDWR | O_CLOEXEC));
     if (fd == -1) {
@@ -569,13 +604,10 @@ status_t WipeBlockDevice(const std::string& path) {
         goto done;
     }
 
-    if ((ioctl(fd, BLKGETSIZE, &nr_sec)) == -1) {
+    if (GetBlockDevSize(fd, &range[1]) != OK) {
         PLOG(ERROR) << "Failed to determine size of " << path;
         goto done;
     }
-
-    range[0] = 0;
-    range[1] = (unsigned long long)nr_sec * 512;
 
     LOG(INFO) << "About to discard " << range[1] << " on " << path;
     if (ioctl(fd, BLKDISCARD, &range) == 0) {
@@ -686,7 +718,7 @@ dev_t GetDevice(const std::string& path) {
 }
 
 status_t RestoreconRecursive(const std::string& path) {
-    LOG(VERBOSE) << "Starting restorecon of " << path;
+    LOG(DEBUG) << "Starting restorecon of " << path;
 
     static constexpr const char* kRestoreconString = "selinux.restorecon_recursive";
 
@@ -695,7 +727,7 @@ status_t RestoreconRecursive(const std::string& path) {
 
     android::base::WaitForProperty(kRestoreconString, path);
 
-    LOG(VERBOSE) << "Finished restorecon of " << path;
+    LOG(DEBUG) << "Finished restorecon of " << path;
     return OK;
 }
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013 The Android Open Source Project
+ * Copyright (C) 2018 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,29 @@
  * limitations under the License.
  */
 
-#include <linux/fs.h>
-#include <sys/ioctl.h>
+#ifndef _CHECKPOINT_H
+#define _CHECKPOINT_H
 
-struct fstab* fstab_default;
+#include <string>
+
+namespace android {
+namespace vold {
+
+bool cp_startCheckpoint(int retry);
+
+bool cp_commitChanges();
+
+void cp_abortChanges();
+
+bool cp_needRollback(const std::string& id);
+
+bool cp_needsCheckpoint();
+
+bool cp_prepareDriveForCheckpoint(const std::string& mountPoint);
+
+bool cp_markBootAttempt();
+
+}  // namespace vold
+}  // namespace android
+
+#endif

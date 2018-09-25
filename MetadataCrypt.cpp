@@ -36,6 +36,7 @@
 #include <cutils/fs.h>
 #include <fs_mgr.h>
 
+#include "Checkpoint.h"
 #include "EncryptInplace.h"
 #include "KeyStorage.h"
 #include "KeyUtil.h"
@@ -59,7 +60,8 @@ static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device) {
         return false;
     }
     auto mount_rc = fs_mgr_do_mount(fstab_default, const_cast<char*>(mount_point),
-                                    const_cast<char*>(blk_device), nullptr);
+                                    const_cast<char*>(blk_device), nullptr,
+                                    android::vold::cp_needsCheckpoint());
     if (setexeccon(nullptr)) {
         PLOG(ERROR) << "Failed to clear setexeccon";
         return false;
@@ -100,20 +102,10 @@ static KeyBuffer default_key_params(const std::string& real_blkdev, const KeyBuf
 }
 
 static bool get_number_of_sectors(const std::string& real_blkdev, uint64_t* nr_sec) {
-    android::base::unique_fd dev_fd(
-        TEMP_FAILURE_RETRY(open(real_blkdev.c_str(), O_RDONLY | O_CLOEXEC, 0)));
-    if (dev_fd == -1) {
-        PLOG(ERROR) << "Unable to open " << real_blkdev << " to measure size";
-        return false;
-    }
-    unsigned long res;
-    // TODO: should use BLKGETSIZE64
-    get_blkdev_size(dev_fd.get(), &res);
-    if (res == 0) {
+    if (android::vold::GetBlockDev512Sectors(real_blkdev, nr_sec) != android::OK) {
         PLOG(ERROR) << "Unable to measure size of " << real_blkdev;
         return false;
     }
-    *nr_sec = res;
     return true;
 }
 
