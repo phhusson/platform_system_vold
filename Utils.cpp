@@ -24,6 +24,7 @@
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
+#include <android-base/unique_fd.h>
 #include <cutils/fs.h>
 #include <logwrap/logwrap.h>
 #include <private/android_filesystem_config.h>
@@ -31,6 +32,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <mntent.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -38,6 +41,7 @@
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <list>
 #include <mutex>
 
 #ifndef UMOUNT_NOFOLLOW
@@ -756,6 +760,102 @@ bool Readlinkat(int dirfd, const std::string& path, std::string* result) {
 
 bool IsRunningInEmulator() {
     return android::base::GetBoolProperty("ro.kernel.qemu", false);
+}
+
+status_t UnmountTree(const std::string& prefix) {
+    FILE* fp = setmntent("/proc/mounts", "r");
+    if (fp == NULL) {
+        PLOG(ERROR) << "Failed to open /proc/mounts";
+        return -errno;
+    }
+
+    // Some volumes can be stacked on each other, so force unmount in
+    // reverse order to give us the best chance of success.
+    std::list<std::string> toUnmount;
+    mntent* mentry;
+    while ((mentry = getmntent(fp)) != NULL) {
+        auto test = std::string(mentry->mnt_dir) + "/";
+        if (android::base::StartsWith(test, prefix)) {
+            toUnmount.push_front(test);
+        }
+    }
+    endmntent(fp);
+
+    for (const auto& path : toUnmount) {
+        if (umount2(path.c_str(), MNT_DETACH)) {
+            PLOG(ERROR) << "Failed to unmount " << path;
+        }
+    }
+    return OK;
+}
+
+static status_t delete_dir_contents(DIR* dir) {
+    // Shamelessly borrowed from android::installd
+    int dfd = dirfd(dir);
+    if (dfd < 0) {
+        return -errno;
+    }
+
+    status_t result;
+    struct dirent* de;
+    while ((de = readdir(dir))) {
+        const char* name = de->d_name;
+        if (de->d_type == DT_DIR) {
+            /* always skip "." and ".." */
+            if (name[0] == '.') {
+                if (name[1] == 0) continue;
+                if ((name[1] == '.') && (name[2] == 0)) continue;
+            }
+
+            android::base::unique_fd subfd(
+                openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+            if (subfd.get() == -1) {
+                PLOG(ERROR) << "Couldn't openat " << name;
+                result = -errno;
+                continue;
+            }
+            std::unique_ptr<DIR, decltype(&closedir)> subdirp(fdopendir(subfd), closedir);
+            if (!subdirp) {
+                PLOG(ERROR) << "Couldn't fdopendir " << name;
+                result = -errno;
+                continue;
+            }
+            result = delete_dir_contents(subdirp.get());
+            if (unlinkat(dfd, name, AT_REMOVEDIR) < 0) {
+                PLOG(ERROR) << "Couldn't unlinkat " << name;
+                result = -errno;
+            }
+        } else {
+            if (unlinkat(dfd, name, 0) < 0) {
+                PLOG(ERROR) << "Couldn't unlinkat " << name;
+                result = -errno;
+            }
+        }
+    }
+    return result;
+}
+
+status_t DeleteDirContentsAndDir(const std::string& pathname) {
+    // Shamelessly borrowed from android::installd
+    std::unique_ptr<DIR, decltype(&closedir)> dirp(opendir(pathname.c_str()), closedir);
+    if (!dirp) {
+        if (errno == ENOENT) {
+            return OK;
+        }
+        PLOG(ERROR) << "Failed to opendir " << pathname;
+        return -errno;
+    }
+    status_t res = delete_dir_contents(dirp.get());
+    if (res < 0) {
+        return res;
+    }
+    dirp.reset(nullptr);
+    if (rmdir(pathname.c_str()) != 0) {
+        PLOG(ERROR) << "rmdir failed on " << pathname;
+        return -errno;
+    }
+    LOG(VERBOSE) << "Success: rmdir on " << pathname;
+    return OK;
 }
 
 }  // namespace vold
