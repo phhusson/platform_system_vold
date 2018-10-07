@@ -19,6 +19,7 @@
 
 #include <fstream>
 #include <list>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
 #include <android-base/unique_fd.h>
+#include <android/hardware/boot/1.0/IBootControl.h>
 #include <cutils/android_reboot.h>
 #include <fcntl.h>
 #include <fs_mgr.h>
@@ -33,6 +35,11 @@
 #include <mntent.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+
+using android::hardware::hidl_string;
+using android::hardware::boot::V1_0::BoolResult;
+using android::hardware::boot::V1_0::IBootControl;
+using android::hardware::boot::V1_0::Slot;
 
 namespace android {
 namespace vold {
@@ -60,6 +67,14 @@ bool setBowState(std::string const& block_device, std::string const& state) {
 bool cp_startCheckpoint(int retry) {
     if (retry < -1) return false;
     std::string content = std::to_string(retry);
+    if (retry == -1) {
+        sp<IBootControl> module = IBootControl::getService();
+        if (module) {
+            std::string suffix;
+            auto cb = [&suffix](hidl_string s) { suffix = s; };
+            if (module->getSuffix(module->getCurrentSlot(), cb).isOk()) content += " " + suffix;
+        }
+    }
     return android::base::WriteStringToFile(content, kMetadataCPFile);
 }
 
@@ -68,19 +83,19 @@ bool cp_commitChanges() {
     // To do this, we walk the list of mounted file systems.
     // But we also need to get the matching fstab entries to see
     // the original flags
-    struct fstab* fstab = fs_mgr_read_fstab_default();
-    if (!fstab) return false;
+    auto fstab_default = std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)>{
+        fs_mgr_read_fstab_default(), fs_mgr_free_fstab};
+    if (!fstab_default) return false;
 
-    struct fstab* mounts = fs_mgr_read_fstab("/proc/mounts");
-    if (mounts == NULL) {
-        fs_mgr_free_fstab(fstab);
-        return false;
-    }
+    auto mounts = std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)>{
+        fs_mgr_read_fstab("/proc/mounts"), fs_mgr_free_fstab};
+    if (!mounts) return false;
 
     // Walk mounted file systems
     for (int i = 0; i < mounts->num_entries; ++i) {
         const fstab_rec* mount_rec = &mounts->recs[i];
-        const fstab_rec* fstab_rec = fs_mgr_get_entry_for_mount_point(fstab, mount_rec->mount_point);
+        const fstab_rec* fstab_rec =
+            fs_mgr_get_entry_for_mount_point(fstab_default.get(), mount_rec->mount_point);
         if (!fstab_rec) continue;
 
         if (fs_mgr_is_checkpoint_fs(fstab_rec)) {
@@ -92,8 +107,6 @@ bool cp_commitChanges() {
             setBowState(mount_rec->blk_device, "2");
         }
     }
-    fs_mgr_free_fstab(mounts);
-    fs_mgr_free_fstab(fstab);
     return android::base::RemoveFileIfExists(kMetadataCPFile);
 }
 
@@ -101,37 +114,53 @@ void cp_abortChanges() {
     android_reboot(ANDROID_RB_RESTART2, 0, nullptr);
 }
 
-bool cp_needRollback(const std::string& id) {
+bool cp_needsRollback() {
     std::string content;
     bool ret;
 
     ret = android::base::ReadFileToString(kMetadataCPFile, &content);
-    if (ret) return content == "0";
+    if (ret) {
+        if (content == "0") return true;
+        if (content.substr(0, 3) == "-1 ") {
+            std::string oldSuffix = content.substr(3);
+            sp<IBootControl> module = IBootControl::getService();
+            std::string newSuffix;
+
+            if (module) {
+                auto cb = [&newSuffix](hidl_string s) { newSuffix = s; };
+                module->getSuffix(module->getCurrentSlot(), cb);
+                if (oldSuffix == newSuffix) return true;
+            }
+        }
+    }
     return false;
 }
 
 bool cp_needsCheckpoint(void) {
     bool ret;
     std::string content;
+    sp<IBootControl> module = IBootControl::getService();
 
+    if (module && module->isSlotMarkedSuccessful(module->getCurrentSlot()) == BoolResult::FALSE)
+        return true;
     ret = android::base::ReadFileToString(kMetadataCPFile, &content);
     if (ret) return content != "0";
     return false;
 }
 
 bool cp_prepareDriveForCheckpoint(const std::string&) {
-    struct fstab* fstab = fs_mgr_read_fstab_default();
-    if (!fstab) return false;
+    auto fstab_default = std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)>{
+        fs_mgr_read_fstab_default(), fs_mgr_free_fstab};
+    if (!fstab_default) return false;
 
-    struct fstab* mounts = fs_mgr_read_fstab("/proc/mounts");
-    if (mounts == NULL) {
-        fs_mgr_free_fstab(fstab);
-        return false;
-    }
+    auto mounts = std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)>{
+        fs_mgr_read_fstab("/proc/mounts"), fs_mgr_free_fstab};
+    if (!mounts) return false;
 
     for (int i = 0; i < mounts->num_entries; ++i) {
         const fstab_rec* mount_rec = &mounts->recs[i];
-        const fstab_rec* fstab_rec = fs_mgr_get_entry_for_mount_point(fstab, mount_rec->mount_point);
+        const fstab_rec* fstab_rec =
+            fs_mgr_get_entry_for_mount_point(fstab_default.get(), mount_rec->mount_point);
         if (!fstab_rec) continue;
 
         if (fs_mgr_is_checkpoint_blk(fstab_rec)) {
@@ -152,8 +181,6 @@ bool cp_prepareDriveForCheckpoint(const std::string&) {
             setBowState(mount_rec->blk_device, "1");
         }
     }
-    fs_mgr_free_fstab(mounts);
-    fs_mgr_free_fstab(fstab);
     return true;
 }
 
@@ -297,8 +324,9 @@ bool cp_markBootAttempt() {
     std::string oldContent, newContent;
     int retry = 0;
     if (!android::base::ReadFileToString(kMetadataCPFile, &oldContent)) return false;
+    std::string retryContent = oldContent.substr(0, oldContent.find_first_of(" "));
 
-    if (!android::base::ParseInt(oldContent, &retry)) return false;
+    if (!android::base::ParseInt(retryContent, &retry)) return false;
     if (retry > 0) retry--;
 
     newContent = std::to_string(retry);
