@@ -236,7 +236,7 @@ static status_t readMetadata(const std::string& path, std::string* fsType, std::
     cmd.push_back(path);
 
     std::vector<std::string> output;
-    status_t res = ForkExecvp(cmd, output, untrusted ? sBlkidUntrustedContext : sBlkidContext);
+    status_t res = ForkExecvp(cmd, &output, untrusted ? sBlkidUntrustedContext : sBlkidContext);
     if (res != OK) {
         LOG(WARNING) << "blkid failed to identify " << path;
         return res;
@@ -262,101 +262,92 @@ status_t ReadMetadataUntrusted(const std::string& path, std::string* fsType, std
     return readMetadata(path, fsType, fsUuid, fsLabel, true);
 }
 
-status_t ForkExecvp(const std::vector<std::string>& args) {
-    return ForkExecvp(args, nullptr);
-}
-
-status_t ForkExecvp(const std::vector<std::string>& args, security_context_t context) {
-    std::lock_guard<std::mutex> lock(kSecurityLock);
-    size_t argc = args.size();
-    char** argv = (char**)calloc(argc, sizeof(char*));
-    for (size_t i = 0; i < argc; i++) {
-        argv[i] = (char*)args[i].c_str();
-        if (i == 0) {
-            LOG(DEBUG) << args[i];
+static std::vector<const char*> ConvertToArgv(const std::vector<std::string>& args) {
+    std::vector<const char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) {
+        if (argv.empty()) {
+            LOG(DEBUG) << arg;
         } else {
-            LOG(DEBUG) << "    " << args[i];
+            LOG(DEBUG) << "    " << arg;
         }
+        argv.emplace_back(arg.data());
     }
-
-    if (context) {
-        if (setexeccon(context)) {
-            LOG(ERROR) << "Failed to setexeccon";
-            abort();
-        }
-    }
-    status_t res = android_fork_execvp(argc, argv, NULL, false, true);
-    if (context) {
-        if (setexeccon(nullptr)) {
-            LOG(ERROR) << "Failed to setexeccon";
-            abort();
-        }
-    }
-
-    free(argv);
-    return res;
+    argv.emplace_back(nullptr);
+    return argv;
 }
 
-status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::string>& output) {
-    return ForkExecvp(args, output, nullptr);
-}
-
-status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::string>& output,
-                    security_context_t context) {
-    std::lock_guard<std::mutex> lock(kSecurityLock);
-    std::string cmd;
-    for (size_t i = 0; i < args.size(); i++) {
-        cmd += args[i] + " ";
-        if (i == 0) {
-            LOG(DEBUG) << args[i];
-        } else {
-            LOG(DEBUG) << "    " << args[i];
-        }
-    }
-    output.clear();
-
-    if (context) {
-        if (setexeccon(context)) {
-            LOG(ERROR) << "Failed to setexeccon";
-            abort();
-        }
-    }
-    FILE* fp = popen(cmd.c_str(), "r");  // NOLINT
-    if (context) {
-        if (setexeccon(nullptr)) {
-            LOG(ERROR) << "Failed to setexeccon";
-            abort();
-        }
-    }
-
+static status_t ReadLinesFromFdAndLog(std::vector<std::string>* output,
+                                      android::base::unique_fd ufd) {
+    std::unique_ptr<FILE, int (*)(FILE*)> fp(android::base::Fdopen(std::move(ufd), "r"), fclose);
     if (!fp) {
-        PLOG(ERROR) << "Failed to popen " << cmd;
+        PLOG(ERROR) << "fdopen in ReadLinesFromFdAndLog";
         return -errno;
     }
+    if (output) output->clear();
     char line[1024];
-    while (fgets(line, sizeof(line), fp) != nullptr) {
+    while (fgets(line, sizeof(line), fp.get()) != nullptr) {
         LOG(DEBUG) << line;
-        output.push_back(std::string(line));
+        if (output) output->emplace_back(line);
     }
-    if (pclose(fp) != 0) {
-        PLOG(ERROR) << "Failed to pclose " << cmd;
+    return OK;
+}
+
+status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::string>* output,
+                    security_context_t context) {
+    auto argv = ConvertToArgv(args);
+
+    android::base::unique_fd pipe_read, pipe_write;
+    if (!android::base::Pipe(&pipe_read, &pipe_write)) {
+        PLOG(ERROR) << "Pipe in ForkExecvp";
         return -errno;
     }
 
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (context) {
+            if (setexeccon(context)) {
+                LOG(ERROR) << "Failed to setexeccon in ForkExecvp";
+                abort();
+            }
+        }
+        pipe_read.reset();
+        if (dup2(pipe_write.get(), STDOUT_FILENO) == -1) {
+            PLOG(ERROR) << "dup2 in ForkExecvp";
+            _exit(EXIT_FAILURE);
+        }
+        pipe_write.reset();
+        execvp(argv[0], const_cast<char**>(argv.data()));
+        PLOG(ERROR) << "exec in ForkExecvp";
+        _exit(EXIT_FAILURE);
+    }
+    if (pid == -1) {
+        PLOG(ERROR) << "fork in ForkExecvp";
+        return -errno;
+    }
+
+    pipe_write.reset();
+    auto st = ReadLinesFromFdAndLog(output, std::move(pipe_read));
+    if (st != 0) return st;
+
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        PLOG(ERROR) << "waitpid in ForkExecvp";
+        return -errno;
+    }
+    if (!WIFEXITED(status)) {
+        LOG(ERROR) << "Process did not exit normally, status: " << status;
+        return -ECHILD;
+    }
+    if (WEXITSTATUS(status)) {
+        LOG(ERROR) << "Process exited with code: " << WEXITSTATUS(status);
+        return WEXITSTATUS(status);
+    }
     return OK;
 }
 
 pid_t ForkExecvpAsync(const std::vector<std::string>& args) {
-    size_t argc = args.size();
-    char** argv = (char**)calloc(argc + 1, sizeof(char*));
-    for (size_t i = 0; i < argc; i++) {
-        argv[i] = (char*)args[i].c_str();
-        if (i == 0) {
-            LOG(DEBUG) << args[i];
-        } else {
-            LOG(DEBUG) << "    " << args[i];
-        }
-    }
+    auto argv = ConvertToArgv(args);
 
     pid_t pid = fork();
     if (pid == 0) {
@@ -364,18 +355,14 @@ pid_t ForkExecvpAsync(const std::vector<std::string>& args) {
         close(STDOUT_FILENO);
         close(STDERR_FILENO);
 
-        if (execvp(argv[0], argv)) {
-            PLOG(ERROR) << "Failed to exec";
-        }
-
-        _exit(1);
+        execvp(argv[0], const_cast<char**>(argv.data()));
+        PLOG(ERROR) << "exec in ForkExecvpAsync";
+        _exit(EXIT_FAILURE);
     }
-
     if (pid == -1) {
-        PLOG(ERROR) << "Failed to exec";
+        PLOG(ERROR) << "fork in ForkExecvpAsync";
+        return -1;
     }
-
-    free(argv);
     return pid;
 }
 
@@ -767,28 +754,9 @@ bool IsRunningInEmulator() {
 }
 
 status_t UnmountTree(const std::string& prefix) {
-    FILE* fp = setmntent("/proc/mounts", "re");
-    if (fp == NULL) {
-        PLOG(ERROR) << "Failed to open /proc/mounts";
+    if (umount2(prefix.c_str(), MNT_DETACH)) {
+        PLOG(ERROR) << "Failed to unmount " << prefix;
         return -errno;
-    }
-
-    // Some volumes can be stacked on each other, so force unmount in
-    // reverse order to give us the best chance of success.
-    std::list<std::string> toUnmount;
-    mntent* mentry;
-    while ((mentry = getmntent(fp)) != NULL) {
-        auto test = std::string(mentry->mnt_dir) + "/";
-        if (android::base::StartsWith(test, prefix)) {
-            toUnmount.push_front(test);
-        }
-    }
-    endmntent(fp);
-
-    for (const auto& path : toUnmount) {
-        if (umount2(path.c_str(), MNT_DETACH)) {
-            PLOG(ERROR) << "Failed to unmount " << path;
-        }
     }
     return OK;
 }
