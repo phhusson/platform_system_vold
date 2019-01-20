@@ -123,6 +123,7 @@ status_t PublicVolume::doMount() {
     mFuseDefault = StringPrintf("/mnt/runtime/default/%s", stableName.c_str());
     mFuseRead = StringPrintf("/mnt/runtime/read/%s", stableName.c_str());
     mFuseWrite = StringPrintf("/mnt/runtime/write/%s", stableName.c_str());
+    mFuseFull = StringPrintf("/mnt/runtime/full/%s", stableName.c_str());
 
     setInternalPath(mRawPath);
     if (getMountFlags() & MountFlags::kVisible) {
@@ -161,12 +162,13 @@ status_t PublicVolume::doMount() {
 
     if (fs_prepare_dir(mFuseDefault.c_str(), 0700, AID_ROOT, AID_ROOT) ||
         fs_prepare_dir(mFuseRead.c_str(), 0700, AID_ROOT, AID_ROOT) ||
-        fs_prepare_dir(mFuseWrite.c_str(), 0700, AID_ROOT, AID_ROOT)) {
+        fs_prepare_dir(mFuseWrite.c_str(), 0700, AID_ROOT, AID_ROOT) ||
+        fs_prepare_dir(mFuseFull.c_str(), 0700, AID_ROOT, AID_ROOT)) {
         PLOG(ERROR) << getId() << " failed to create FUSE mount points";
         return -errno;
     }
 
-    dev_t before = GetDevice(mFuseWrite);
+    dev_t before = GetDevice(mFuseFull);
 
     if (!(mFusePid = fork())) {
         if (getMountFlags() & MountFlags::kPrimary) {
@@ -183,36 +185,16 @@ status_t PublicVolume::doMount() {
                 PLOG(ERROR) << "Failed to exec";
             }
         } else {
-            // In Pre-Q, apps have full read access to secondary storage devices but only
-            // write access for their package specific directories. In Q, they only have access
-            // to their own sandboxes and they can write anywhere inside the sandbox. Instead of
-            // updating sdcardfs to allow packages writing into their own sandboxes, we could
-            // just allow them to write anywhere by passing "-w".
             // clang-format off
-            if (GetBoolProperty(kIsolatedStorage, false)) {
-                if (execl(kFusePath, kFusePath,
-                        "-u", "1023", // AID_MEDIA_RW
-                        "-g", "1023", // AID_MEDIA_RW
-                        "-U", std::to_string(getMountUserId()).c_str(),
-                        "-w",
-                        mRawPath.c_str(),
-                        stableName.c_str(),
-                        NULL)) {
-                    // clang-format on
-                    PLOG(ERROR) << "Failed to exec";
-                }
-            } else {
-                // clang-format off
-                if (execl(kFusePath, kFusePath,
-                        "-u", "1023", // AID_MEDIA_RW
-                        "-g", "1023", // AID_MEDIA_RW
-                        "-U", std::to_string(getMountUserId()).c_str(),
-                        mRawPath.c_str(),
-                        stableName.c_str(),
-                        NULL)) {
-                    // clang-format on
-                    PLOG(ERROR) << "Failed to exec";
-                }
+            if (execl(kFusePath, kFusePath,
+                    "-u", "1023", // AID_MEDIA_RW
+                    "-g", "1023", // AID_MEDIA_RW
+                    "-U", std::to_string(getMountUserId()).c_str(),
+                    mRawPath.c_str(),
+                    stableName.c_str(),
+                    NULL)) {
+                // clang-format on
+                PLOG(ERROR) << "Failed to exec";
             }
         }
 
@@ -226,7 +208,7 @@ status_t PublicVolume::doMount() {
     }
 
     nsecs_t start = systemTime(SYSTEM_TIME_BOOTTIME);
-    while (before == GetDevice(mFuseWrite)) {
+    while (before == GetDevice(mFuseFull)) {
         LOG(DEBUG) << "Waiting for FUSE to spin up...";
         usleep(50000);  // 50ms
 
@@ -255,16 +237,19 @@ status_t PublicVolume::doUnmount() {
     ForceUnmount(mFuseDefault);
     ForceUnmount(mFuseRead);
     ForceUnmount(mFuseWrite);
+    ForceUnmount(mFuseFull);
     ForceUnmount(mRawPath);
 
     rmdir(mFuseDefault.c_str());
     rmdir(mFuseRead.c_str());
     rmdir(mFuseWrite.c_str());
+    rmdir(mFuseFull.c_str());
     rmdir(mRawPath.c_str());
 
     mFuseDefault.clear();
     mFuseRead.clear();
     mFuseWrite.clear();
+    mFuseFull.clear();
     mRawPath.clear();
 
     return OK;

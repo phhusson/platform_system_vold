@@ -79,6 +79,7 @@ static const char* kPathUserMount = "/mnt/user";
 static const char* kPathVirtualDisk = "/data/misc/vold/virtual_disk";
 
 static const char* kIsolatedStorage = "persist.sys.isolated_storage";
+static const char* kIsolatedStorageSnapshot = "sys.isolated_storage_snapshot";
 static const char* kPropVirtualDisk = "persist.sys.virtual_disk";
 
 static const std::string kEmptyString("");
@@ -107,6 +108,10 @@ VolumeManager::VolumeManager() {
 }
 
 VolumeManager::~VolumeManager() {}
+
+static bool hasIsolatedStorage() {
+    return GetBoolProperty(kIsolatedStorageSnapshot, GetBoolProperty(kIsolatedStorage, false));
+}
 
 int VolumeManager::updateVirtualDisk() {
     ATRACE_NAME("VolumeManager::updateVirtualDisk");
@@ -420,8 +425,13 @@ int VolumeManager::mountPkgSpecificDirsForRunningProcs(
         return -1;
     }
 
-    struct stat fullWriteSb;
-    if (TEMP_FAILURE_RETRY(stat("/mnt/runtime/write", &fullWriteSb)) == -1) {
+    struct stat mntFullSb;
+    struct stat mntWriteSb;
+    if (TEMP_FAILURE_RETRY(stat("/mnt/runtime/full", &mntFullSb)) == -1) {
+        PLOG(ERROR) << "Failed to stat /mnt/runtime/full";
+        return -1;
+    }
+    if (TEMP_FAILURE_RETRY(stat("/mnt/runtime/write", &mntWriteSb)) == -1) {
         PLOG(ERROR) << "Failed to stat /mnt/runtime/write";
         return -1;
     }
@@ -500,7 +510,8 @@ int VolumeManager::mountPkgSpecificDirsForRunningProcs(
 
             int mountMode;
             if (remountMode == -1) {
-                mountMode = getMountModeForRunningProc(packagesForUid, userId, fullWriteSb);
+                mountMode =
+                    getMountModeForRunningProc(packagesForUid, userId, mntWriteSb, mntFullSb);
                 if (mountMode == -1) {
                     _exit(1);
                 }
@@ -520,6 +531,7 @@ int VolumeManager::mountPkgSpecificDirsForRunningProcs(
                 }
             }
             if (mountMode == VoldNativeService::REMOUNT_MODE_FULL ||
+                mountMode == VoldNativeService::REMOUNT_MODE_LEGACY ||
                 mountMode == VoldNativeService::REMOUNT_MODE_NONE) {
                 // These mount modes are not going to change dynamically, so don't bother
                 // unmounting/remounting dirs.
@@ -573,7 +585,8 @@ int VolumeManager::mountPkgSpecificDirsForRunningProcs(
 }
 
 int VolumeManager::getMountModeForRunningProc(const std::vector<std::string>& packagesForUid,
-                                              userid_t userId, struct stat& mntWriteStat) {
+                                              userid_t userId, struct stat& mntWriteStat,
+                                              struct stat& mntFullStat) {
     struct stat storageSb;
     if (TEMP_FAILURE_RETRY(stat("/storage", &storageSb)) == -1) {
         PLOG(ERROR) << "Failed to stat /storage";
@@ -581,9 +594,11 @@ int VolumeManager::getMountModeForRunningProc(const std::vector<std::string>& pa
     }
 
     // Some packages have access to full external storage, identify processes belonging
-    // to those packages by comparing inode no.s of /mnt/runtime/write and /storage
-    if (storageSb.st_dev == mntWriteStat.st_dev && storageSb.st_ino == mntWriteStat.st_ino) {
+    // to those packages by comparing inode no.s of /mnt/runtime/full and /storage
+    if (storageSb.st_dev == mntFullStat.st_dev && storageSb.st_ino == mntFullStat.st_ino) {
         return VoldNativeService::REMOUNT_MODE_FULL;
+    } else if (storageSb.st_dev == mntWriteStat.st_dev && storageSb.st_ino == mntWriteStat.st_ino) {
+        return VoldNativeService::REMOUNT_MODE_LEGACY;
     }
 
     std::string obbMountFile =
@@ -843,7 +858,7 @@ int VolumeManager::onUserStarted(userid_t userId, const std::vector<std::string>
     if (mPrimary) {
         linkPrimary(userId);
     }
-    if (GetBoolProperty(kIsolatedStorage, false)) {
+    if (hasIsolatedStorage()) {
         std::vector<std::string> visibleVolLabels;
         for (auto& volId : mVisibleVolumeIds) {
             auto vol = findVolume(volId);
@@ -863,11 +878,11 @@ int VolumeManager::onUserStopped(userid_t userId) {
     LOG(VERBOSE) << "onUserStopped: " << userId;
     mStartedUsers.erase(userId);
 
-    if (GetBoolProperty(kIsolatedStorage, false)) {
+    if (hasIsolatedStorage()) {
         mUserPackages.erase(userId);
         std::string mntTargetDir = StringPrintf("/mnt/user/%d", userId);
-        if (android::vold::UnmountTree(mntTargetDir) != 0) {
-            PLOG(ERROR) << "unmountTree on " << mntTargetDir << " failed";
+        if (android::vold::UnmountTreeWithPrefix(mntTargetDir) < 0) {
+            PLOG(ERROR) << "UnmountTreeWithPrefix on " << mntTargetDir << " failed";
             return -errno;
         }
         if (android::vold::DeleteDirContentsAndDir(mntTargetDir) < 0) {
@@ -897,7 +912,7 @@ int VolumeManager::addSandboxIds(const std::vector<int32_t>& appIds,
 
 int VolumeManager::prepareSandboxForApp(const std::string& packageName, appid_t appId,
                                         const std::string& sandboxId, userid_t userId) {
-    if (!GetBoolProperty(kIsolatedStorage, false)) {
+    if (!hasIsolatedStorage()) {
         return 0;
     } else if (mStartedUsers.find(userId) == mStartedUsers.end()) {
         // User not started, no need to do anything now. Required bind mounts for the package will
@@ -923,7 +938,7 @@ int VolumeManager::prepareSandboxForApp(const std::string& packageName, appid_t 
 
 int VolumeManager::destroySandboxForApp(const std::string& packageName,
                                         const std::string& sandboxId, userid_t userId) {
-    if (!GetBoolProperty(kIsolatedStorage, false)) {
+    if (!hasIsolatedStorage()) {
         return 0;
     }
     LOG(VERBOSE) << "destroySandboxForApp: " << packageName << ", sandboxId=" << sandboxId
@@ -969,8 +984,8 @@ int VolumeManager::destroySandboxForAppOnVol(const std::string& packageName,
                  << ", volLabel=" << volLabel;
     std::string pkgSandboxTarget =
         StringPrintf("/mnt/user/%d/package/%s", userId, packageName.c_str());
-    if (android::vold::UnmountTree(pkgSandboxTarget)) {
-        PLOG(ERROR) << "UnmountTree failed on " << pkgSandboxTarget;
+    if (android::vold::UnmountTreeWithPrefix(pkgSandboxTarget) < 0) {
+        PLOG(ERROR) << "UnmountTreeWithPrefix failed on " << pkgSandboxTarget;
     }
 
     std::string sandboxDir = StringPrintf("/mnt/runtime/write/%s", volLabel.c_str());
@@ -1001,7 +1016,7 @@ int VolumeManager::onSecureKeyguardStateChanged(bool isShowing) {
 }
 
 int VolumeManager::onVolumeMounted(android::vold::VolumeBase* vol) {
-    if (!GetBoolProperty(kIsolatedStorage, false)) {
+    if (!hasIsolatedStorage()) {
         return 0;
     }
 
@@ -1036,7 +1051,7 @@ int VolumeManager::onVolumeMounted(android::vold::VolumeBase* vol) {
 }
 
 int VolumeManager::onVolumeUnmounted(android::vold::VolumeBase* vol) {
-    if (!GetBoolProperty(kIsolatedStorage, false)) {
+    if (!hasIsolatedStorage()) {
         return 0;
     }
 
@@ -1070,8 +1085,8 @@ int VolumeManager::destroySandboxesForVol(android::vold::VolumeBase* vol, userid
     for (auto& packageName : packageNames) {
         std::string volSandboxRoot = StringPrintf("/mnt/user/%d/package/%s/%s", userId,
                                                   packageName.c_str(), vol->getLabel().c_str());
-        if (android::vold::UnmountTree(volSandboxRoot) != 0) {
-            PLOG(ERROR) << "unmountTree on " << volSandboxRoot << " failed";
+        if (android::vold::UnmountTreeWithPrefix(volSandboxRoot) < 0) {
+            PLOG(ERROR) << "UnmountTreeWithPrefix on " << volSandboxRoot << " failed";
             continue;
         }
         if (android::vold::DeleteDirContentsAndDir(volSandboxRoot) < 0) {
@@ -1084,7 +1099,7 @@ int VolumeManager::destroySandboxesForVol(android::vold::VolumeBase* vol, userid
 }
 
 int VolumeManager::setPrimary(const std::shared_ptr<android::vold::VolumeBase>& vol) {
-    if (GetBoolProperty(kIsolatedStorage, false)) {
+    if (hasIsolatedStorage()) {
         return 0;
     }
     mPrimary = vol;
@@ -1095,7 +1110,7 @@ int VolumeManager::setPrimary(const std::shared_ptr<android::vold::VolumeBase>& 
 }
 
 int VolumeManager::remountUid(uid_t uid, int32_t mountMode) {
-    if (!GetBoolProperty(kIsolatedStorage, false)) {
+    if (!hasIsolatedStorage()) {
         return remountUidLegacy(uid, mountMode);
     }
 
@@ -1283,7 +1298,7 @@ int VolumeManager::reset() {
     mVisibleVolumeIds.clear();
 
     // For unmounting dirs under /mnt/user/<user-id>/package/<package-name>
-    android::vold::UnmountTree("/mnt/user/");
+    android::vold::UnmountTreeWithPrefix("/mnt/user/");
     return 0;
 }
 
