@@ -45,6 +45,7 @@ using android::fs_mgr::ReadDefaultFstab;
 using android::fs_mgr::ReadFstabFromFile;
 using android::hardware::hidl_string;
 using android::hardware::boot::V1_0::BoolResult;
+using android::hardware::boot::V1_0::CommandResult;
 using android::hardware::boot::V1_0::IBootControl;
 using android::hardware::boot::V1_0::Slot;
 
@@ -108,6 +109,16 @@ Status cp_commitChanges() {
     if (!isCheckpointing) {
         return Status::ok();
     }
+    sp<IBootControl> module = IBootControl::getService();
+    if (module) {
+        CommandResult cr;
+        module->markBootSuccessful([&cr](CommandResult result) { cr = result; });
+        if (!cr.success) {
+            std::string msg = "Error marking booted successfully: " + std::string(cr.errMsg);
+            return Status::fromExceptionCode(EINVAL, String8(msg.c_str()));
+        }
+        LOG(INFO) << "Marked slot as booted successfully.";
+    }
     // Must take action for list of mounted checkpointed things here
     // To do this, we walk the list of mounted file systems.
     // But we also need to get the matching fstab entries to see
@@ -138,6 +149,7 @@ Status cp_commitChanges() {
         }
     }
     SetProperty("vold.checkpoint_committed", "1");
+    LOG(INFO) << "Checkpoint has been committed.";
     isCheckpointing = false;
     if (!android::base::RemoveFileIfExists(kMetadataCPFile, &err_str))
         return Status::fromExceptionCode(errno, err_str.c_str());
@@ -221,7 +233,6 @@ Status cp_prepareCheckpoint() {
 }
 
 namespace {
-const int kBlockSize = 4096;
 const int kSectorSize = 512;
 
 typedef uint64_t sector_t;
@@ -233,12 +244,14 @@ struct log_entry {
     uint32_t checksum;
 } __attribute__((packed));
 
-struct log_sector {
+struct log_sector_v1_0 {
     uint32_t magic;
+    uint16_t header_version;
+    uint16_t header_size;
+    uint32_t block_size;
     uint32_t count;
     uint32_t sequence;
     uint64_t sector0;
-    struct log_entry entries[];
 } __attribute__((packed));
 
 // MAGIC is BOW in ascii
@@ -296,20 +309,21 @@ void crc32(const void* data, size_t n_bytes, uint32_t* crc) {
     }
 }
 
-}  // namespace
-
-static void read(std::fstream& device, std::vector<log_entry> const& logs, sector_t sector,
-                 char* buffer) {
+void read(std::fstream& device, std::vector<log_entry> const& logs, sector_t sector, char* buffer,
+          uint32_t block_size) {
+    // Crude approach at first where we do this sector by sector and just scan
+    // the entire logs for remappings each time
     for (auto l = logs.rbegin(); l != logs.rend(); l++)
         if (sector >= l->source && (sector - l->source) * kSectorSize < l->size)
             sector = sector - l->source + l->dest;
 
     device.seekg(sector * kSectorSize);
-    device.read(buffer, kBlockSize);
+    device.read(buffer, block_size);
 }
 
-static std::vector<char> read(std::fstream& device, std::vector<log_entry> const& logs,
-                              bool validating, sector_t sector, uint32_t size) {
+// Read from the device as though we were restoring, even if we are validating
+std::vector<char> read(std::fstream& device, std::vector<log_entry> const& logs, bool validating,
+                       sector_t sector, uint32_t size, uint32_t block_size) {
     if (!validating) {
         std::vector<char> buffer(size);
         device.seekg(sector * kSectorSize);
@@ -317,15 +331,14 @@ static std::vector<char> read(std::fstream& device, std::vector<log_entry> const
         return buffer;
     }
 
-    // Crude approach at first where we do this sector by sector and just scan
-    // the entire logs for remappings each time
     std::vector<char> buffer(size);
-
-    for (uint32_t i = 0; i < size; i += kBlockSize, sector += kBlockSize / kSectorSize)
-        read(device, logs, sector, &buffer[i]);
+    for (uint32_t i = 0; i < size; i += block_size, sector += block_size / kSectorSize)
+        read(device, logs, sector, &buffer[i], block_size);
 
     return buffer;
 }
+
+}  // namespace
 
 Status cp_restoreCheckpoint(const std::string& blockDevice) {
     bool validating = true;
@@ -341,21 +354,29 @@ Status cp_restoreCheckpoint(const std::string& blockDevice) {
             PLOG(ERROR) << "Cannot open " << blockDevice;
             return Status::fromExceptionCode(errno, ("Cannot open " + blockDevice).c_str());
         }
-        auto buffer = read(device, logs, validating, 0, kBlockSize);
-        log_sector& ls = *reinterpret_cast<log_sector*>(&buffer[0]);
-        if (ls.magic != kMagic) {
+
+        log_sector_v1_0 original_ls;
+        device.read(reinterpret_cast<char*>(&original_ls), sizeof(original_ls));
+        if (original_ls.magic != kMagic) {
             LOG(ERROR) << "No magic";
             return Status::fromExceptionCode(EINVAL, "No magic");
         }
 
-        LOG(INFO) << action << " " << ls.sequence << " log sectors";
+        LOG(INFO) << action << " " << original_ls.sequence << " log sectors";
 
-        for (int sequence = ls.sequence; sequence >= 0 && status.isOk(); sequence--) {
-            auto buffer = read(device, logs, validating, 0, kBlockSize);
-            log_sector& ls = *reinterpret_cast<log_sector*>(&buffer[0]);
+        for (int sequence = original_ls.sequence; sequence >= 0 && status.isOk(); sequence--) {
+            auto buffer =
+                read(device, logs, validating, 0, original_ls.block_size, original_ls.block_size);
+            log_sector_v1_0 const& ls = *reinterpret_cast<log_sector_v1_0*>(&buffer[0]);
             if (ls.magic != kMagic) {
                 LOG(ERROR) << "No magic!";
                 status = Status::fromExceptionCode(EINVAL, "No magic");
+                break;
+            }
+
+            if (ls.block_size != original_ls.block_size) {
+                LOG(ERROR) << "Block size mismatch!";
+                status = Status::fromExceptionCode(EINVAL, "Block size mismatch");
                 break;
             }
 
@@ -370,13 +391,17 @@ Status cp_restoreCheckpoint(const std::string& blockDevice) {
 
             LOG(INFO) << action << " from log sector " << ls.sequence;
 
-            for (log_entry* le = &ls.entries[ls.count - 1]; le >= ls.entries; --le) {
-                LOG(INFO) << action << " " << le->size << " bytes from sector " << le->dest
-                          << " to " << le->source << " with checksum " << std::hex << le->checksum;
-                auto buffer = read(device, logs, validating, le->dest, le->size);
-                uint32_t checksum = le->source / (kBlockSize / kSectorSize);
-                for (size_t i = 0; i < le->size; i += kBlockSize) {
-                    crc32(&buffer[i], kBlockSize, &checksum);
+            for (log_entry* le =
+                     reinterpret_cast<log_entry*>(&buffer[ls.header_size]) + ls.count - 1;
+                 le >= reinterpret_cast<log_entry*>(&buffer[ls.header_size]); --le) {
+                // This is very noisy - limit to DEBUG only
+                LOG(DEBUG) << action << " " << le->size << " bytes from sector " << le->dest
+                           << " to " << le->source << " with checksum " << std::hex << le->checksum;
+
+                auto buffer = read(device, logs, validating, le->dest, le->size, ls.block_size);
+                uint32_t checksum = le->source / (ls.block_size / kSectorSize);
+                for (size_t i = 0; i < le->size; i += ls.block_size) {
+                    crc32(&buffer[i], ls.block_size, &checksum);
                 }
 
                 if (le->checksum && checksum != le->checksum) {
@@ -401,9 +426,10 @@ Status cp_restoreCheckpoint(const std::string& blockDevice) {
             }
 
             LOG(WARNING) << "Checkpoint validation failed - attempting to roll forward";
-            auto buffer = read(device, logs, false, ls.sector0, kBlockSize);
+            auto buffer = read(device, logs, false, original_ls.sector0, original_ls.block_size,
+                               original_ls.block_size);
             device.seekg(0);
-            device.write(&buffer[0], kBlockSize);
+            device.write(&buffer[0], original_ls.block_size);
             return Status::ok();
         }
 
