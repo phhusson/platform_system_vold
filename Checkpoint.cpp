@@ -291,7 +291,7 @@ static void cp_healthDaemon(std::string mnt_pnt, std::string blk_device, bool is
             int ret;
             std::string size_filename = std::string("/sys/") + blk_device.substr(5) + "/bow/free";
             std::string content;
-            ret = android::base::ReadFileToString(kMetadataCPFile, &content);
+            ret = android::base::ReadFileToString(size_filename, &content);
             if (ret) {
                 free_bytes = std::strtoul(content.c_str(), NULL, 10);
             }
@@ -330,7 +330,7 @@ Status cp_prepareCheckpoint() {
         if (fstab_rec->fs_mgr_flags.checkpoint_blk) {
             android::base::unique_fd fd(
                 TEMP_FAILURE_RETRY(open(mount_rec.mount_point.c_str(), O_RDONLY | O_CLOEXEC)));
-            if (!fd) {
+            if (fd == -1) {
                 PLOG(ERROR) << "Failed to open mount point" << mount_rec.mount_point;
                 continue;
             }
@@ -346,7 +346,7 @@ Status cp_prepareCheckpoint() {
         }
         if (fstab_rec->fs_mgr_flags.checkpoint_blk || fstab_rec->fs_mgr_flags.checkpoint_fs) {
             std::thread(cp_healthDaemon, std::string(mount_rec.mount_point),
-                        std::string(mount_rec.mount_point),
+                        std::string(mount_rec.blk_device),
                         fstab_rec->fs_mgr_flags.checkpoint_fs == 1)
                 .detach();
         }
@@ -575,7 +575,7 @@ Status cp_restoreCheckpoint(const std::string& blockDevice, int restore_limit) {
         Status status = Status::ok();
 
         LOG(INFO) << action << " checkpoint on " << blockDevice;
-        base::unique_fd device_fd(open(blockDevice.c_str(), O_RDWR));
+        base::unique_fd device_fd(open(blockDevice.c_str(), O_RDWR | O_CLOEXEC));
         if (device_fd < 0) {
             PLOG(ERROR) << "Cannot open " << blockDevice;
             return Status::fromExceptionCode(errno, ("Cannot open " + blockDevice).c_str());
