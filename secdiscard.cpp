@@ -75,7 +75,8 @@ int main(int argc, const char* const argv[]) {
 #define F2FS_IOC_SET_PIN_FILE _IOW(F2FS_IOCTL_MAGIC, 13, __u32)
 #define F2FS_IOC_GET_PIN_FILE _IOR(F2FS_IOCTL_MAGIC, 14, __u32)
 #endif
-        android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(target.c_str(), O_WRONLY, 0)));
+        android::base::unique_fd fd(
+            TEMP_FAILURE_RETRY(open(target.c_str(), O_WRONLY | O_CLOEXEC, 0)));
         if (fd == -1) {
             LOG(ERROR) << "Secure discard open failed for: " << target;
             return 0;
@@ -94,7 +95,6 @@ int main(int argc, const char* const argv[]) {
         }
         set = 0;
         ioctl(fd, F2FS_IOC_SET_PIN_FILE, &set);
-        LOG(DEBUG) << "Discarded: " << target;
     }
     return 0;
 }
@@ -143,9 +143,8 @@ bool secdiscard_path(const std::string& path) {
         range[0] = fiemap->fm_extents[i].fe_physical;
         range[1] = fiemap->fm_extents[i].fe_length;
         if (ioctl(fs_fd.get(), BLKSECDISCARD, range) == -1) {
-            PLOG(ERROR) << "Unable to BLKSECDISCARD " << path;
+            // Use zero overwrite as a fallback for BLKSECDISCARD
             if (!overwrite_with_zeros(fs_fd.get(), range[0], range[1])) return false;
-            LOG(DEBUG) << "Used zero overwrite";
         }
     }
     return true;
