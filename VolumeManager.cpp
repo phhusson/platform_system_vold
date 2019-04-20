@@ -119,7 +119,8 @@ VolumeManager::VolumeManager() {
 VolumeManager::~VolumeManager() {}
 
 static bool hasIsolatedStorage() {
-    return GetBoolProperty(kIsolatedStorageSnapshot, GetBoolProperty(kIsolatedStorage, true));
+    return false &&
+           GetBoolProperty(kIsolatedStorageSnapshot, GetBoolProperty(kIsolatedStorage, true));
 }
 
 int VolumeManager::updateVirtualDisk() {
@@ -1098,7 +1099,12 @@ int VolumeManager::remountUidLegacy(uid_t uid, int32_t mountMode) {
             mode = "read";
             break;
         case VoldNativeService::REMOUNT_MODE_WRITE:
+        case VoldNativeService::REMOUNT_MODE_LEGACY:
+        case VoldNativeService::REMOUNT_MODE_INSTALLER:
             mode = "write";
+            break;
+        case VoldNativeService::REMOUNT_MODE_FULL:
+            mode = "full";
             break;
         default:
             PLOG(ERROR) << "Unknown mode " << std::to_string(mountMode);
