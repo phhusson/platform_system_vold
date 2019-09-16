@@ -1643,7 +1643,9 @@ static int cryptfs_restart_internal(int restart_main) {
             SLOGE("Failed to setexeccon");
             return -1;
         }
-        bool needs_cp = android::vold::cp_needsCheckpoint();
+        bool supportsCheckpoint = false;
+        android::vold::cp_supportsCheckpoint(supportsCheckpoint);
+        bool needs_cp = supportsCheckpoint && android::vold::cp_needsCheckpoint();
         while ((mount_rc = fs_mgr_do_mount(&fstab_default, DATA_MNT_POINT, crypto_blkdev, 0,
                                            needs_cp)) != 0) {
             if (mount_rc == FS_MGR_DOMNT_BUSY) {
