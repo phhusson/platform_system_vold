@@ -35,7 +35,11 @@ static const char* kFsckPath = "/system/bin/fsck.exfat";
 
 bool IsSupported() {
     return access(kMkfsPath, X_OK) == 0 && access(kFsckPath, X_OK) == 0 &&
-           (IsFilesystemSupported("exfat") || IsFilesystemSupported("sdfat"));
+           (
+            IsFilesystemSupported("exfat") ||
+            IsFilesystemSupported("sdfat") ||
+            IsFilesystemSupported("texfat")
+            );
 }
 
 status_t Check(const std::string& source) {
@@ -64,6 +68,8 @@ status_t Mount(const std::string& source, const std::string& target, int ownerUi
     const char *fs = "exfat";
     if(IsFilesystemSupported("sdfat"))
         fs = "sdfat";
+    if(IsFilesystemSupported("texfat"))
+        fs = "texfat";
     if (mount(source.c_str(), target.c_str(), fs, mountFlags, mountData.c_str()) == 0) {
         return 0;
     }
