@@ -54,6 +54,7 @@
 #endif
 
 using namespace std::chrono_literals;
+using android::base::EndsWith;
 using android::base::ReadFileToString;
 using android::base::StartsWith;
 using android::base::StringPrintf;
@@ -134,11 +135,15 @@ int SetQuotaProjectId(std::string path, long projectId) {
     return ioctl(fd, FS_IOC_FSSETXATTR, &fsx);
 }
 
-int PrepareDirsFromRoot(std::string path, std::string root, mode_t mode, uid_t uid, gid_t gid) {
+int PrepareAppDirsFromRoot(std::string path, std::string root, mode_t mode, uid_t uid, gid_t gid) {
     int ret = 0;
+    bool isCacheDir = false;
     if (!StartsWith(path, root)) {
         return -1;
     }
+    // Cache directories (eg "/storage/emulated/Android/data/com.foo/cache/") need special treatment
+    isCacheDir = EndsWith(root, "/Android/data/") && EndsWith(path, "cache/");
+
     std::string to_create_from_root = path.substr(root.length());
 
     size_t pos = 0;
@@ -149,6 +154,21 @@ int PrepareDirsFromRoot(std::string path, std::string root, mode_t mode, uid_t u
         ret = fs_prepare_dir(root.c_str(), mode, uid, gid);
         if (ret) {
             break;
+        }
+        if (!IsFilesystemSupported("sdcardfs")) {
+            long projectId;
+            // All app-specific directories share the same project-ID, except
+            // the cache directory
+            if (isCacheDir && component == "cache") {
+                // Note that this also matches paths like:
+                // /Android/data/com.foo/bar/cache/
+                // This is currently safe because we're never asked to create
+                // such directories.
+                projectId = uid - AID_APP_START + AID_CACHE_GID_START;
+            } else {
+                projectId = uid - AID_APP_START + AID_EXT_GID_START;
+            }
+            ret = SetQuotaProjectId(root, projectId);
         }
     }
 
@@ -1164,5 +1184,31 @@ status_t UnmountUserFuse(userid_t user_id, const std::string& absolute_lower_pat
     return result;
 }
 
+status_t PrepareAndroidDirs(const std::string& volumeRoot) {
+    std::string androidDir = volumeRoot + kAndroidDir;
+    std::string androidDataDir = volumeRoot + kAppDataDir;
+    std::string androidObbDir = volumeRoot + kAppObbDir;
+
+    bool useSdcardFs = IsFilesystemSupported("sdcardfs");
+
+    if (fs_prepare_dir(androidDir.c_str(), 0771, AID_MEDIA_RW, AID_MEDIA_RW) != 0) {
+        PLOG(ERROR) << "Failed to create " << androidDir;
+        return -errno;
+    }
+
+    gid_t dataGid = useSdcardFs ? AID_MEDIA_RW : AID_EXT_DATA_RW;
+    if (fs_prepare_dir(androidDataDir.c_str(), 0771, AID_MEDIA_RW, dataGid) != 0) {
+        PLOG(ERROR) << "Failed to create " << androidDataDir;
+        return -errno;
+    }
+
+    gid_t obbGid = useSdcardFs ? AID_MEDIA_RW : AID_EXT_OBB_RW;
+    if (fs_prepare_dir(androidObbDir.c_str(), 0771, AID_MEDIA_RW, obbGid) != 0) {
+        PLOG(ERROR) << "Failed to create " << androidObbDir;
+        return -errno;
+    }
+
+    return OK;
+}
 }  // namespace vold
 }  // namespace android
