@@ -56,6 +56,14 @@ static const char* kFn_keymaster_key_blob = "keymaster_key_blob";
 static const char* kFn_keymaster_key_blob_upgraded = "keymaster_key_blob_upgraded";
 
 static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device) {
+    // We're about to mount data not verified by verified boot.  Tell Keymaster that early boot has
+    // ended.
+    //
+    // TODO(paulcrowley): Make a Keymaster singleton or something, so we don't have to repeatedly
+    // open and initialize the service.
+    ::android::vold::Keymaster keymaster;
+    keymaster.earlyBootEnded();
+
     // fs_mgr_do_mount runs fsck. Use setexeccon to run trusted
     // partitions in the fsck domain.
     if (setexeccon(android::vold::sFsckContext)) {
@@ -105,6 +113,23 @@ static void commit_key(const std::string& dir) {
     LOG(INFO) << "Old Key deleted: " << dir;
 }
 
+static bool retrieveMetadataKey(bool create_if_absent, const std::string& key_path,
+                                const std::string& tmp_path, KeyBuffer* key, bool keepOld) {
+    if (pathExists(key_path)) {
+        LOG(DEBUG) << "Key exists, using: " << key_path;
+        if (!retrieveKey(key_path, kEmptyAuthentication, key, keepOld)) return false;
+    } else {
+        if (!create_if_absent) {
+            LOG(ERROR) << "No key found in " << key_path;
+            return false;
+        }
+        LOG(INFO) << "Creating new key in " << key_path;
+        if (!randomKey(key)) return false;
+        if (!storeKeyAtomically(key_path, tmp_path, kEmptyAuthentication, *key)) return false;
+    }
+    return true;
+}
+
 static bool read_key(const FstabEntry& data_rec, bool create_if_absent, KeyBuffer* key) {
     if (data_rec.metadata_key_dir.empty()) {
         LOG(ERROR) << "Failed to get metadata_key_dir";
@@ -135,9 +160,7 @@ static bool read_key(const FstabEntry& data_rec, bool create_if_absent, KeyBuffe
             unlink(newKeyPath.c_str());
     }
     bool needs_cp = cp_needsCheckpoint();
-    if (!android::vold::retrieveKey(create_if_absent, kEmptyAuthentication, dir, temp, key,
-                                    needs_cp))
-        return false;
+    if (!retrieveMetadataKey(create_if_absent, dir, temp, key, needs_cp)) return false;
     if (needs_cp && pathExists(newKeyPath)) std::thread(commit_key, dir).detach();
     return true;
 }
