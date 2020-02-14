@@ -64,6 +64,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <thread>
+
 extern "C" {
 #include <crypto_scrypt.h>
 }
@@ -71,6 +74,7 @@ extern "C" {
 using android::base::ParseUint;
 using android::base::StringPrintf;
 using android::fs_mgr::GetEntryForMountPoint;
+using android::vold::KeyBuffer;
 using namespace android::dm;
 using namespace std::chrono_literals;
 
@@ -1219,9 +1223,22 @@ static int create_crypto_blk_dev(struct crypt_mnt_ftr* crypt_ftr, const unsigned
 }
 
 static int delete_crypto_blk_dev(const std::string& name) {
+    bool ret;
     auto& dm = DeviceMapper::Instance();
-    if (!dm.DeleteDevice(name)) {
-        SLOGE("Cannot remove dm-crypt device %s: %s\n", name.c_str(), strerror(errno));
+    // TODO(b/149396179) there appears to be a race somewhere in the system where trying
+    // to delete the device fails with EBUSY; for now, work around this by retrying.
+    int tries = 5;
+    while (tries-- > 0) {
+        ret = dm.DeleteDevice(name);
+        if (ret || errno != EBUSY) {
+            break;
+        }
+        SLOGW("DM_DEV Cannot remove dm-crypt device %s: %s, retrying...\n", name.c_str(),
+              strerror(errno));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!ret) {
+        SLOGE("DM_DEV Cannot remove dm-crypt device %s: %s\n", name.c_str(), strerror(errno));
         return -1;
     }
     return 0;
@@ -1910,8 +1927,13 @@ errout:
  * as any metadata is been stored in a separate, small partition.  We
  * assume it must be using our same crypt type and keysize.
  */
-int cryptfs_setup_ext_volume(const char* label, const char* real_blkdev, const unsigned char* key,
+int cryptfs_setup_ext_volume(const char* label, const char* real_blkdev, const KeyBuffer& key,
                              std::string* out_crypto_blkdev) {
+    if (key.size() != cryptfs_get_keysize()) {
+        SLOGE("Raw keysize %zu does not match crypt keysize %" PRIu32, key.size(),
+              cryptfs_get_keysize());
+        return -1;
+    }
     uint64_t nr_sec = 0;
     if (android::vold::GetBlockDev512Sectors(real_blkdev, &nr_sec) != android::OK) {
         SLOGE("Failed to get size of %s: %s", real_blkdev, strerror(errno));
@@ -1929,15 +1951,8 @@ int cryptfs_setup_ext_volume(const char* label, const char* real_blkdev, const u
         android::base::GetBoolProperty("ro.crypto.allow_encrypt_override", false))
         flags |= CREATE_CRYPTO_BLK_DEV_FLAGS_ALLOW_ENCRYPT_OVERRIDE;
 
-    return create_crypto_blk_dev(&ext_crypt_ftr, key, real_blkdev, out_crypto_blkdev, label, flags);
-}
-
-/*
- * Called by vold when it's asked to unmount an encrypted external
- * storage volume.
- */
-int cryptfs_revert_ext_volume(const char* label) {
-    return delete_crypto_blk_dev(label);
+    return create_crypto_blk_dev(&ext_crypt_ftr, reinterpret_cast<const unsigned char*>(key.data()),
+                                 real_blkdev, out_crypto_blkdev, label, flags);
 }
 
 int cryptfs_crypto_complete(void) {
