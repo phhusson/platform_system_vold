@@ -25,6 +25,7 @@
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 #include <cutils/fs.h>
+#include <libdm/dm.h>
 #include <private/android_filesystem_config.h>
 
 #include <fcntl.h>
@@ -43,7 +44,7 @@ namespace vold {
 
 static const unsigned int kMajorBlockMmc = 179;
 
-PrivateVolume::PrivateVolume(dev_t device, const std::string& keyRaw)
+PrivateVolume::PrivateVolume(dev_t device, const KeyBuffer& keyRaw)
     : VolumeBase(Type::kPrivate), mRawDevice(device), mKeyRaw(keyRaw) {
     setId(StringPrintf("private:%u,%u", major(device), minor(device)));
     mRawDevPath = StringPrintf("/dev/block/vold/%s", getId().c_str());
@@ -64,21 +65,17 @@ status_t PrivateVolume::doCreate() {
     if (CreateDeviceNode(mRawDevPath, mRawDevice)) {
         return -EIO;
     }
-    if (mKeyRaw.size() != cryptfs_get_keysize()) {
-        PLOG(ERROR) << getId() << " Raw keysize " << mKeyRaw.size()
-                    << " does not match crypt keysize " << cryptfs_get_keysize();
+
+    // Recover from stale vold by tearing down any old mappings
+    auto& dm = dm::DeviceMapper::Instance();
+    if (!dm.DeleteDeviceIfExists(getId())) {
+        PLOG(ERROR) << "Cannot remove dm device " << getId();
         return -EIO;
     }
 
-    // Recover from stale vold by tearing down any old mappings
-    cryptfs_revert_ext_volume(getId().c_str());
-
     // TODO: figure out better SELinux labels for private volumes
 
-    unsigned char* key = (unsigned char*)mKeyRaw.data();
-    char crypto_blkdev[MAXPATHLEN];
-    int res = cryptfs_setup_ext_volume(getId().c_str(), mRawDevPath.c_str(), key, crypto_blkdev);
-    mDmDevPath = crypto_blkdev;
+    int res = cryptfs_setup_ext_volume(getId().c_str(), mRawDevPath.c_str(), mKeyRaw, &mDmDevPath);
     if (res != 0) {
         PLOG(ERROR) << getId() << " failed to setup cryptfs";
         return -EIO;
@@ -88,8 +85,10 @@ status_t PrivateVolume::doCreate() {
 }
 
 status_t PrivateVolume::doDestroy() {
-    if (cryptfs_revert_ext_volume(getId().c_str())) {
-        LOG(ERROR) << getId() << " failed to revert cryptfs";
+    auto& dm = dm::DeviceMapper::Instance();
+    if (!dm.DeleteDevice(getId())) {
+        PLOG(ERROR) << "Cannot remove dm device " << getId();
+        return -EIO;
     }
     return DestroyDeviceNode(mRawDevPath);
 }

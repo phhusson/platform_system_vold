@@ -39,6 +39,7 @@ using namespace ::android::hardware::keymaster::V4_1;
 // dangerous thing to rely on, but in this case its implications are simple and straightforward:
 // km::ErrorCode refers to the 4.0 ErrorCode, though we pull everything else from 4.1.
 using ErrorCode = ::android::hardware::keymaster::V4_0::ErrorCode;
+using V4_1_ErrorCode = ::android::hardware::keymaster::V4_1::ErrorCode;
 
 }  // namespace km
 
@@ -113,6 +114,8 @@ class Keymaster {
     explicit operator bool() { return mDevice.get() != nullptr; }
     // Generate a key in the keymaster from the given params.
     bool generateKey(const km::AuthorizationSet& inParams, std::string* key);
+    // Exports a keymaster key with STORAGE_KEY tag wrapped with a per-boot ephemeral key
+    bool exportKey(const KeyBuffer& kmKey, std::string* key);
     // If the keymaster supports it, permanently delete a key.
     bool deleteKey(const std::string& key);
     // Replace stored key blob in response to KM_ERROR_KEY_REQUIRES_UPGRADE.
@@ -124,6 +127,10 @@ class Keymaster {
                              const km::HardwareAuthToken& authToken,
                              km::AuthorizationSet* outParams);
     bool isSecure();
+
+    // Tell Keymaster that early boot has ended and early boot-only keys can no longer be created or
+    // used.
+    void earlyBootEnded();
 
   private:
     sp<KmDevice> mDevice;

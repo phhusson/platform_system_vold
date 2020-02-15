@@ -33,20 +33,23 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <linux/posix_acl.h>
+#include <linux/posix_acl_xattr.h>
 #include <mntent.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #include <list>
 #include <mutex>
+#include <regex>
 #include <thread>
 
 #ifndef UMOUNT_NOFOLLOW
@@ -73,6 +76,11 @@ static const char* kBlkidPath = "/system/bin/blkid";
 static const char* kKeyPath = "/data/misc/vold";
 
 static const char* kProcFilesystems = "/proc/filesystems";
+
+static const char* kAndroidDir = "/Android/";
+static const char* kAppDataDir = "/Android/data/";
+static const char* kAppMediaDir = "/Android/media/";
+static const char* kAppObbDir = "/Android/obb/";
 
 // Lock used to protect process-level SELinux changes from racing with each
 // other between multiple threads.
@@ -116,7 +124,72 @@ status_t DestroyDeviceNode(const std::string& path) {
     }
 }
 
-int SetQuotaProjectId(std::string path, long projectId) {
+// Sets a default ACL where the owner and group can read/write/execute.
+// Other users aren't allowed anything.
+int SetDefault770Acl(const std::string& path, uid_t uid, gid_t gid) {
+    if (IsFilesystemSupported("sdcardfs")) {
+        // sdcardfs magically takes care of this
+        return OK;
+    }
+
+    static constexpr size_t size =
+            sizeof(posix_acl_xattr_header) + 3 * sizeof(posix_acl_xattr_entry);
+    auto buf = std::make_unique<uint8_t[]>(size);
+
+    posix_acl_xattr_header* acl_header = reinterpret_cast<posix_acl_xattr_header*>(buf.get());
+    acl_header->a_version = POSIX_ACL_XATTR_VERSION;
+
+    posix_acl_xattr_entry* entry =
+            reinterpret_cast<posix_acl_xattr_entry*>(buf.get() + sizeof(posix_acl_xattr_header));
+
+    entry[0].e_tag = ACL_USER_OBJ;
+    entry[0].e_perm = ACL_READ | ACL_WRITE | ACL_EXECUTE;
+    entry[0].e_id = uid;
+
+    entry[1].e_tag = ACL_GROUP_OBJ;
+    entry[1].e_perm = ACL_READ | ACL_WRITE | ACL_EXECUTE;
+    entry[1].e_id = gid;
+
+    entry[2].e_tag = ACL_OTHER;
+    entry[2].e_perm = 0;
+    entry[2].e_id = 0;
+
+    int ret = setxattr(path.c_str(), XATTR_NAME_POSIX_ACL_DEFAULT, acl_header, size, 0);
+
+    if (ret != 0) {
+        PLOG(ERROR) << "Failed to set default ACL on " << path;
+    }
+
+    return ret;
+}
+
+int SetQuotaInherit(const std::string& path) {
+    unsigned long flags;
+
+    android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC)));
+    if (fd == -1) {
+        PLOG(ERROR) << "Failed to open " << path << " to set project id inheritance.";
+        return -1;
+    }
+
+    int ret = ioctl(fd, FS_IOC_GETFLAGS, &flags);
+    if (ret == -1) {
+        PLOG(ERROR) << "Failed to get flags for " << path << " to set project id inheritance.";
+        return ret;
+    }
+
+    flags |= FS_PROJINHERIT_FL;
+
+    ret = ioctl(fd, FS_IOC_SETFLAGS, &flags);
+    if (ret == -1) {
+        PLOG(ERROR) << "Failed to set flags for " << path << " to set project id inheritance.";
+        return ret;
+    }
+
+    return 0;
+}
+
+int SetQuotaProjectId(const std::string& path, long projectId) {
     struct fsxattr fsx;
 
     android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC)));
@@ -135,44 +208,118 @@ int SetQuotaProjectId(std::string path, long projectId) {
     return ioctl(fd, FS_IOC_FSSETXATTR, &fsx);
 }
 
-int PrepareAppDirsFromRoot(std::string path, std::string root, mode_t mode, uid_t uid, gid_t gid) {
-    int ret = 0;
-    bool isCacheDir = false;
-    if (!StartsWith(path, root)) {
-        return -1;
+int PrepareDirWithProjectId(const std::string& path, mode_t mode, uid_t uid, gid_t gid,
+                            long projectId) {
+    int ret = fs_prepare_dir(path.c_str(), mode, uid, gid);
+
+    if (ret != 0) {
+        return ret;
     }
-    // Cache directories (eg "/storage/emulated/Android/data/com.foo/cache/") need special treatment
-    isCacheDir = EndsWith(root, "/Android/data/") && EndsWith(path, "cache/");
 
-    std::string to_create_from_root = path.substr(root.length());
-
-    size_t pos = 0;
-    while ((pos = to_create_from_root.find('/')) != std::string::npos) {
-        auto component = to_create_from_root.substr(0, pos);
-        to_create_from_root.erase(0, pos + 1);
-        root = root + component + "/";
-        ret = fs_prepare_dir(root.c_str(), mode, uid, gid);
-        if (ret) {
-            break;
-        }
-        if (!IsFilesystemSupported("sdcardfs")) {
-            long projectId;
-            // All app-specific directories share the same project-ID, except
-            // the cache directory
-            if (isCacheDir && component == "cache") {
-                // Note that this also matches paths like:
-                // /Android/data/com.foo/bar/cache/
-                // This is currently safe because we're never asked to create
-                // such directories.
-                projectId = uid - AID_APP_START + AID_CACHE_GID_START;
-            } else {
-                projectId = uid - AID_APP_START + AID_EXT_GID_START;
-            }
-            ret = SetQuotaProjectId(root, projectId);
-        }
+    if (!IsFilesystemSupported("sdcardfs")) {
+        ret = SetQuotaProjectId(path, projectId);
     }
 
     return ret;
+}
+
+int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int appUid) {
+    long projectId;
+    size_t pos;
+    int ret = 0;
+
+    // Make sure the Android/ directories exist and are setup correctly
+    ret = PrepareAndroidDirs(root);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to prepare Android/ directories.";
+        return ret;
+    }
+
+    // Now create the application-specific subdir(s)
+    // path is something like /data/media/0/Android/data/com.foo/files
+    // First, chop off the volume root, eg /data/media/0
+    std::string pathFromRoot = path.substr(root.length());
+
+    uid_t uid = appUid;
+    gid_t gid = AID_MEDIA_RW;
+    std::string appDir;
+
+    // Check that the next part matches one of the allowed Android/ dirs
+    if (StartsWith(pathFromRoot, kAppDataDir)) {
+        appDir = kAppDataDir;
+        if (!IsFilesystemSupported("sdcardfs")) {
+            gid = AID_EXT_DATA_RW;
+        }
+    } else if (StartsWith(pathFromRoot, kAppMediaDir)) {
+        appDir = kAppMediaDir;
+        if (!IsFilesystemSupported("sdcardfs")) {
+            gid = AID_MEDIA_RW;
+        }
+    } else if (StartsWith(pathFromRoot, kAppMediaDir)) {
+        appDir = kAppObbDir;
+        if (!IsFilesystemSupported("sdcardfs")) {
+            gid = AID_EXT_OBB_RW;
+        }
+    } else {
+        LOG(ERROR) << "Invalid application directory: " << path;
+        return -EINVAL;
+    }
+
+    // mode = 770, plus sticky bit on directory to inherit GID when apps
+    // create subdirs
+    mode_t mode = S_IRWXU | S_IRWXG | S_ISGID;
+    // the project ID for application-specific directories is directly
+    // derived from their uid
+
+    // Chop off the generic application-specific part, eg /Android/data/
+    // this leaves us with something like com.foo/files/
+    std::string leftToCreate = pathFromRoot.substr(appDir.length());
+    if (!EndsWith(leftToCreate, "/")) {
+        leftToCreate += "/";
+    }
+    std::string pathToCreate = root + appDir;
+    int depth = 0;
+    bool withinCache = false;
+    while ((pos = leftToCreate.find('/')) != std::string::npos) {
+        std::string component = leftToCreate.substr(0, pos + 1);
+        leftToCreate = leftToCreate.erase(0, pos + 1);
+        pathToCreate = pathToCreate + component;
+
+        if (appDir == kAppDataDir && depth == 1 && component == "cache/") {
+            // All dirs use the "app" project ID, except for the cache dirs in
+            // Android/data, eg Android/data/com.foo/cache
+            // Note that this "sticks" - eg subdirs of this dir need the same
+            // project ID.
+            withinCache = true;
+        }
+        if (withinCache) {
+            projectId = uid - AID_APP_START + AID_CACHE_GID_START;
+        } else {
+            projectId = uid - AID_APP_START + AID_EXT_GID_START;
+        }
+        ret = PrepareDirWithProjectId(pathToCreate, mode, uid, gid, projectId);
+        if (ret != 0) {
+            return ret;
+        }
+
+        if (depth == 0) {
+            // Set the default ACL on the top-level application-specific directories,
+            // to ensure that even if applications run with a umask of 0077,
+            // new directories within these directories will allow the GID
+            // specified here to write; this is necessary for apps like
+            // installers and MTP, that require access here.
+            //
+            // See man (5) acl for more details.
+            ret = SetDefault770Acl(pathToCreate, uid, gid);
+            if (ret != 0) {
+                return ret;
+            }
+        }
+
+        depth++;
+    }
+
+    return OK;
 }
 
 status_t PrepareDir(const std::string& path, mode_t mode, uid_t uid, gid_t gid) {
@@ -1188,6 +1335,7 @@ status_t PrepareAndroidDirs(const std::string& volumeRoot) {
     std::string androidDir = volumeRoot + kAndroidDir;
     std::string androidDataDir = volumeRoot + kAppDataDir;
     std::string androidObbDir = volumeRoot + kAppObbDir;
+    std::string androidMediaDir = volumeRoot + kAppMediaDir;
 
     bool useSdcardFs = IsFilesystemSupported("sdcardfs");
 
@@ -1205,6 +1353,11 @@ status_t PrepareAndroidDirs(const std::string& volumeRoot) {
     gid_t obbGid = useSdcardFs ? AID_MEDIA_RW : AID_EXT_OBB_RW;
     if (fs_prepare_dir(androidObbDir.c_str(), 0771, AID_MEDIA_RW, obbGid) != 0) {
         PLOG(ERROR) << "Failed to create " << androidObbDir;
+        return -errno;
+    }
+
+    if (fs_prepare_dir(androidMediaDir.c_str(), 0771, AID_MEDIA_RW, AID_MEDIA_RW) != 0) {
+        PLOG(ERROR) << "Failed to create " << androidMediaDir;
         return -errno;
     }
 

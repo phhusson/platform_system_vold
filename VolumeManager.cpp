@@ -63,7 +63,6 @@
 #include "VoldNativeService.h"
 #include "VoldUtil.h"
 #include "VolumeManager.h"
-#include "cryptfs.h"
 #include "fs/Ext4.h"
 #include "fs/Vfat.h"
 #include "model/EmulatedVolume.h"
@@ -83,7 +82,7 @@ using android::vold::DeleteDirContents;
 using android::vold::DeleteDirContentsAndDir;
 using android::vold::IsFilesystemSupported;
 using android::vold::PrepareAndroidDirs;
-using android::vold::PrepareAppDirsFromRoot;
+using android::vold::PrepareAppDirFromRoot;
 using android::vold::PrivateVolume;
 using android::vold::Symlink;
 using android::vold::Unlink;
@@ -115,7 +114,7 @@ VolumeManager* VolumeManager::Instance() {
 VolumeManager::VolumeManager() {
     mDebug = false;
     mNextObbId = 0;
-    mNextStubVolumeId = 0;
+    mNextStubId = 0;
     // For security reasons, assume that a secure keyguard is
     // showing until we hear otherwise
     mSecureKeyguardShowing = true;
@@ -338,11 +337,6 @@ std::shared_ptr<android::vold::VolumeBase> VolumeManager::findVolume(const std::
     for (const auto& disk : mDisks) {
         auto vol = disk->findVolume(id);
         if (vol != nullptr) {
-            return vol;
-        }
-    }
-    for (const auto& vol : mStubVolumes) {
-        if (vol->getId() == id) {
             return vol;
         }
     }
@@ -768,7 +762,6 @@ int VolumeManager::shutdown() {
     }
 
     mInternalEmulatedVolumes.clear();
-    mStubVolumes.clear();
     mDisks.clear();
     mPendingDisks.clear();
     android::vold::sSleepOnUnmount = true;
@@ -782,9 +775,6 @@ int VolumeManager::unmountAll() {
     // First, try gracefully unmounting all known devices
     for (const auto& vol : mInternalEmulatedVolumes) {
         vol->unmount();
-    }
-    for (const auto& stub : mStubVolumes) {
-        stub->unmount();
     }
     for (const auto& disk : mDisks) {
         disk->unmountAll();
@@ -824,31 +814,7 @@ int VolumeManager::unmountAll() {
     return 0;
 }
 
-static gid_t getAppDirGid(const std::string& appDir) {
-    // Create app-specific dirs with the correct UID/GID
-    gid_t gid = AID_MEDIA_RW;
-    if (!IsFilesystemSupported("sdcardfs")) {
-        if (appDir == android::vold::kAppDataDir) {
-            gid = AID_EXT_DATA_RW;
-        } else if (appDir == android::vold::kAppObbDir) {
-            gid = AID_EXT_OBB_RW;
-        } else if (appDir == android::vold::kAppMediaDir) {
-            gid = AID_MEDIA_RW;
-        } else {
-            gid = AID_MEDIA_RW;
-        }
-    }
-
-    return gid;
-}
-
-static bool isValidAppDirRoot(const std::string& appDirRoot) {
-    return appDirRoot == android::vold::kAppDataDir || appDirRoot == android::vold::kAppMediaDir ||
-           appDirRoot == android::vold::kAppObbDir;
-}
-
-int VolumeManager::setupAppDir(const std::string& path, const std::string& appDirRoot,
-                               int32_t appUid) {
+int VolumeManager::setupAppDir(const std::string& path, int32_t appUid) {
     // Only offer to create directories for paths managed by vold
     if (!StartsWith(path, "/storage/")) {
         LOG(ERROR) << "Failed to find mounted volume for " << path;
@@ -890,28 +856,11 @@ int VolumeManager::setupAppDir(const std::string& path, const std::string& appDi
     // on /storage/emulated/10 means /mnt/user/0/emulated/10
     const std::string lowerPath =
             volume->getInternalPath() + path.substr(volume->getPath().length());
-    const std::string lowerAppDirRoot =
-            volume->getInternalPath() + appDirRoot.substr(volume->getPath().length());
 
-    // Do some sanity checking on the app dir (relative from root)
     const std::string volumeRoot = volume->getRootPath();  // eg /data/media/0
 
-    // eg, if lowerAppDirRoot = /data/media/0/Android/data, this is /Android/data
-    const std::string relativeAppRoot = lowerAppDirRoot.substr(volumeRoot.length());
-    if (!isValidAppDirRoot(relativeAppRoot)) {
-        LOG(ERROR) << path << " is not a valid application directory.";
-        return -EINVAL;
-    }
-
-    // Make sure the Android/ directories exist and are setup correctly
-    int ret = PrepareAndroidDirs(volumeRoot);
-    if (ret != 0) {
-        LOG(ERROR) << "Failed to prepare Android/ directories.";
-        return ret;
-    }
-
-    gid_t gid = getAppDirGid(relativeAppRoot);
-    return PrepareAppDirsFromRoot(lowerPath, lowerAppDirRoot, 0770, appUid, gid);
+    // Create the app paths we need from the root
+    return PrepareAppDirFromRoot(lowerPath, volumeRoot, appUid);
 }
 
 int VolumeManager::createObb(const std::string& sourcePath, const std::string& sourceKey,
@@ -942,27 +891,31 @@ int VolumeManager::destroyObb(const std::string& volId) {
 
 int VolumeManager::createStubVolume(const std::string& sourcePath, const std::string& mountPath,
                                     const std::string& fsType, const std::string& fsUuid,
-                                    const std::string& fsLabel, std::string* outVolId) {
-    int id = mNextStubVolumeId++;
-    auto vol = std::shared_ptr<android::vold::VolumeBase>(
-        new android::vold::StubVolume(id, sourcePath, mountPath, fsType, fsUuid, fsLabel));
-    vol->create();
+                                    const std::string& fsLabel, int32_t flags,
+                                    std::string* outVolId) {
+    dev_t stubId = --mNextStubId;
+    auto vol = std::shared_ptr<android::vold::StubVolume>(
+            new android::vold::StubVolume(stubId, sourcePath, mountPath, fsType, fsUuid, fsLabel));
 
-    mStubVolumes.push_back(vol);
+    int32_t passedFlags = android::vold::Disk::Flags::kStub;
+    passedFlags |= (flags & android::vold::Disk::Flags::kUsb);
+    passedFlags |= (flags & android::vold::Disk::Flags::kSd);
+    // StubDisk doesn't have device node corresponds to it. So, a fake device
+    // number is used.
+    auto disk = std::shared_ptr<android::vold::Disk>(
+            new android::vold::Disk("stub", stubId, "stub", passedFlags));
+    disk->initializePartition(vol);
+    handleDiskAdded(disk);
     *outVolId = vol->getId();
     return android::OK;
 }
 
 int VolumeManager::destroyStubVolume(const std::string& volId) {
-    auto i = mStubVolumes.begin();
-    while (i != mStubVolumes.end()) {
-        if ((*i)->getId() == volId) {
-            (*i)->destroy();
-            i = mStubVolumes.erase(i);
-        } else {
-            ++i;
-        }
-    }
+    auto tokens = android::base::Split(volId, ":");
+    CHECK(tokens.size() == 2);
+    dev_t stubId;
+    CHECK(android::base::ParseUint(tokens[1], &stubId));
+    handleDiskRemoved(stubId);
     return android::OK;
 }
 

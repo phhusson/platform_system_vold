@@ -17,17 +17,19 @@
 #define ATRACE_TAG ATRACE_TAG_PACKAGE_MANAGER
 
 #include "VoldNativeService.h"
+
 #include "Benchmark.h"
 #include "CheckEncryption.h"
-#include "IdleMaint.h"
-#include "MoveStorage.h"
-#include "Process.h"
-#include "VolumeManager.h"
-
 #include "Checkpoint.h"
 #include "FsCrypt.h"
+#include "IdleMaint.h"
 #include "MetadataCrypt.h"
+#include "MoveStorage.h"
+#include "Process.h"
+#include "VoldUtil.h"
+#include "VolumeManager.h"
 #include "cryptfs.h"
+
 #include "incfs_ndk.h"
 
 #include <fstream>
@@ -456,14 +458,12 @@ binder::Status VoldNativeService::remountUid(int32_t uid, int32_t remountMode) {
     return translate(VolumeManager::Instance()->remountUid(uid, remountMode));
 }
 
-binder::Status VoldNativeService::setupAppDir(const std::string& path,
-                                              const std::string& appDirRoot, int32_t appUid) {
+binder::Status VoldNativeService::setupAppDir(const std::string& path, int32_t appUid) {
     ENFORCE_SYSTEM_OR_ROOT;
     CHECK_ARGUMENT_PATH(path);
-    CHECK_ARGUMENT_PATH(appDirRoot);
     ACQUIRE_LOCK;
 
-    return translate(VolumeManager::Instance()->setupAppDir(path, appDirRoot, appUid));
+    return translate(VolumeManager::Instance()->setupAppDir(path, appUid));
 }
 
 binder::Status VoldNativeService::createObb(const std::string& sourcePath,
@@ -486,9 +486,12 @@ binder::Status VoldNativeService::destroyObb(const std::string& volId) {
     return translate(VolumeManager::Instance()->destroyObb(volId));
 }
 
-binder::Status VoldNativeService::createStubVolume(
-    const std::string& sourcePath, const std::string& mountPath, const std::string& fsType,
-    const std::string& fsUuid, const std::string& fsLabel, std::string* _aidl_return) {
+binder::Status VoldNativeService::createStubVolume(const std::string& sourcePath,
+                                                   const std::string& mountPath,
+                                                   const std::string& fsType,
+                                                   const std::string& fsUuid,
+                                                   const std::string& fsLabel, int32_t flags,
+                                                   std::string* _aidl_return) {
     ENFORCE_SYSTEM_OR_ROOT;
     CHECK_ARGUMENT_PATH(sourcePath);
     CHECK_ARGUMENT_PATH(mountPath);
@@ -497,8 +500,8 @@ binder::Status VoldNativeService::createStubVolume(
     // is quite meaningless.
     ACQUIRE_LOCK;
 
-    return translate(VolumeManager::Instance()->createStubVolume(sourcePath, mountPath, fsType,
-                                                                 fsUuid, fsLabel, _aidl_return));
+    return translate(VolumeManager::Instance()->createStubVolume(
+            sourcePath, mountPath, fsType, fsUuid, fsLabel, flags, _aidl_return));
 }
 
 binder::Status VoldNativeService::destroyStubVolume(const std::string& volId) {

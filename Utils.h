@@ -36,11 +36,6 @@ namespace vold {
 
 static const char* kPropFuse = "persist.sys.fuse";
 
-static const char* kAndroidDir = "/Android/";
-static const char* kAppDataDir = "/Android/data/";
-static const char* kAppMediaDir = "/Android/media/";
-static const char* kAppObbDir = "/Android/obb/";
-
 /* SELinux contexts used depending on the block device type */
 extern security_context_t sBlkidContext;
 extern security_context_t sBlkidUntrustedContext;
@@ -53,15 +48,16 @@ extern bool sSleepOnUnmount;
 status_t CreateDeviceNode(const std::string& path, dev_t dev);
 status_t DestroyDeviceNode(const std::string& path);
 
-int SetQuotaProjectId(std::string path, long projectId);
+int SetQuotaInherit(const std::string& path);
+int SetQuotaProjectId(const std::string& path, long projectId);
 /*
- * Recursively calls fs_prepare_dir() on all components in 'path', starting at 'root'.
- * 'path' must start with 'root'. Sets up quota project IDs correctly.
+ * Creates and sets up an application-specific path on external
+ * storage with the correct ACL and project ID (if needed).
  *
  * ONLY for use with app-specific data directories on external storage!
  * (eg, /Android/data/com.foo, /Android/obb/com.foo, etc.)
  */
-int PrepareAppDirsFromRoot(std::string path, std::string root, mode_t mode, uid_t uid, gid_t gid);
+int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int appUid);
 
 /* fs_prepare_dir wrapper that creates with SELinux context */
 status_t PrepareDir(const std::string& path, mode_t mode, uid_t uid, gid_t gid);
