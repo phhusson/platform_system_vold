@@ -26,6 +26,7 @@
 #include <cutils/properties.h>
 
 #include "KeyBuffer.h"
+#include "KeyUtil.h"
 
 #define CRYPT_FOOTER_OFFSET 0x4000
 
@@ -73,8 +74,6 @@ int cryptfs_get_password_type(void);
 const char* cryptfs_get_password(void);
 void cryptfs_clear_password(void);
 int cryptfs_isConvertibleToFBE(void);
-
-uint32_t cryptfs_get_keysize();
-const char* cryptfs_get_crypto_name();
+const android::vold::KeyGeneration cryptfs_get_keygen();
 
 #endif /* ANDROID_VOLD_CRYPTFS_H */
