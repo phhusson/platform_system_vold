@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,19 @@
  * limitations under the License.
  */
 
-#ifndef _PROCESS_H
-#define _PROCESS_H
+#pragma once
+
+#include <string>
+
+#include "KeyBuffer.h"
 
 namespace android {
 namespace vold {
 
-int KillProcessesWithOpenFiles(const std::string& path, int signal);
-int KillProcessesWithMounts(const std::string& path, int signal);
+bool generate_volume_key(android::vold::KeyBuffer* key);
+
+bool setup_ext_volume(const std::string& label, const std::string& blk_device,
+                      const android::vold::KeyBuffer& key, std::string* out_crypto_blkdev);
 
 }  // namespace vold
 }  // namespace android
-
-#endif

@@ -145,6 +145,7 @@ cc_library_static {
         "model/PublicVolume.cpp",
         "model/StubVolume.cpp",
         "model/VolumeBase.cpp",
+        "model/VolumeEncryption.cpp",
     ],
     product_variables: {
         arc: {
@@ -167,6 +168,7 @@ cc_library_static {
     ],
     whole_static_libs: [
         "com.android.sysprop.apex",
+        "libc++fs"
     ],
 }
 
