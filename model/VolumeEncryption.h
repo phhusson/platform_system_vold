@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,17 @@
 
 #pragma once
 
-#include <fstab/fstab.h>
+#include <string>
 
-extern android::fs_mgr::Fstab fstab_default;
+#include "KeyBuffer.h"
 
-#define DATA_MNT_POINT "/data"
+namespace android {
+namespace vold {
+
+bool generate_volume_key(android::vold::KeyBuffer* key);
+
+bool setup_ext_volume(const std::string& label, const std::string& blk_device,
+                      const android::vold::KeyBuffer& key, std::string* out_crypto_blkdev);
+
+}  // namespace vold
+}  // namespace android

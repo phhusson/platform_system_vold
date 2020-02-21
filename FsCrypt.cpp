@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include <private/android_filesystem_config.h>
+#include <private/android_projectid_config.h>
 
 #include "android/os/IVold.h"
 
@@ -65,7 +66,7 @@ using android::vold::BuildDataPath;
 using android::vold::IsFilesystemSupported;
 using android::vold::kEmptyAuthentication;
 using android::vold::KeyBuffer;
-using android::vold::makeGen;
+using android::vold::KeyGeneration;
 using android::vold::retrieveKey;
 using android::vold::retrieveOrGenerateKey;
 using android::vold::SetQuotaInherit;
@@ -96,6 +97,11 @@ std::map<userid_t, EncryptionPolicy> s_de_policies;
 std::map<userid_t, EncryptionPolicy> s_ce_policies;
 
 }  // namespace
+
+// Returns KeyGeneration suitable for key as described in EncryptionOptions
+static KeyGeneration makeGen(const EncryptionOptions& options) {
+    return KeyGeneration{FSCRYPT_MAX_KEY_SIZE, true, options.use_hw_wrapped_key};
+}
 
 static bool fscrypt_is_emulated() {
     return property_get_bool("persist.sys.emulate_fbe", false);
@@ -229,13 +235,18 @@ static bool install_storage_key(const std::string& mountpoint, const EncryptionO
 
 // Retrieve the options to use for encryption policies on adoptable storage.
 static bool get_volume_file_encryption_options(EncryptionOptions* options) {
-    auto contents_mode =
-            android::base::GetProperty("ro.crypto.volume.contents_mode", "aes-256-xts");
+    // If we give the empty string, libfscrypt will use the default (currently XTS)
+    auto contents_mode = android::base::GetProperty("ro.crypto.volume.contents_mode", "");
+    // HEH as default was always a mistake. Use the libfscrypt default (CTS)
+    // for devices launching on versions above Android 10.
+    auto first_api_level = GetFirstApiLevel();
+    constexpr uint64_t pre_gki_level = 29;
     auto filenames_mode =
-            android::base::GetProperty("ro.crypto.volume.filenames_mode", "aes-256-heh");
+            android::base::GetProperty("ro.crypto.volume.filenames_mode",
+                                       first_api_level > pre_gki_level ? "" : "aes-256-heh");
     auto options_string = android::base::GetProperty("ro.crypto.volume.options",
-                                                     contents_mode + ":" + filenames_mode + ":v1");
-    if (!ParseOptions(options_string, options)) {
+                                                     contents_mode + ":" + filenames_mode);
+    if (!ParseOptionsForApiLevel(first_api_level, options_string, options)) {
         LOG(ERROR) << "Unable to parse volume encryption options: " << options_string;
         return false;
     }
@@ -804,7 +815,8 @@ bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
         // Setup quota project ID and inheritance policy
         if (!IsFilesystemSupported("sdcardfs")) {
             if (SetQuotaInherit(media_ce_path) != 0) return false;
-            if (SetQuotaProjectId(media_ce_path, multiuser_get_uid(user_id, AID_MEDIA_RW)) != 0) {
+            if (SetQuotaProjectId(media_ce_path,
+                                  multiuser_get_uid(user_id, PROJECT_ID_EXT_DEFAULT)) != 0) {
                 return false;
             }
         }
