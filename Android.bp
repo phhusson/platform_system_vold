@@ -112,6 +112,7 @@ cc_library_static {
         "Benchmark.cpp",
         "CheckEncryption.cpp",
         "Checkpoint.cpp",
+        "CryptoType.cpp",
         "Devmapper.cpp",
         "EncryptInplace.cpp",
         "FileDeviceUtils.cpp",
@@ -142,8 +143,9 @@ cc_library_static {
         "model/ObbVolume.cpp",
         "model/PrivateVolume.cpp",
         "model/PublicVolume.cpp",
-        "model/VolumeBase.cpp",
         "model/StubVolume.cpp",
+        "model/VolumeBase.cpp",
+        "model/VolumeEncryption.cpp",
     ],
     product_variables: {
         arc: {
@@ -166,6 +168,7 @@ cc_library_static {
     ],
     whole_static_libs: [
         "com.android.sysprop.apex",
+        "libc++fs"
     ],
 }
 

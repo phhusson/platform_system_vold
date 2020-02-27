@@ -35,11 +35,7 @@ namespace android {
 namespace vold {
 
 static const char* kPropFuse = "persist.sys.fuse";
-
-static const char* kAndroidDir = "/Android/";
-static const char* kAppDataDir = "/Android/data/";
-static const char* kAppMediaDir = "/Android/media/";
-static const char* kAppObbDir = "/Android/obb/";
+static const char* kVoldAppDataIsolationEnabled = "persist.sys.vold_app_data_isolation_enabled";
 
 /* SELinux contexts used depending on the block device type */
 extern security_context_t sBlkidContext;
@@ -53,15 +49,17 @@ extern bool sSleepOnUnmount;
 status_t CreateDeviceNode(const std::string& path, dev_t dev);
 status_t DestroyDeviceNode(const std::string& path);
 
-int SetQuotaProjectId(std::string path, long projectId);
+int SetQuotaInherit(const std::string& path);
+int SetQuotaProjectId(const std::string& path, long projectId);
 /*
- * Recursively calls fs_prepare_dir() on all components in 'path', starting at 'root'.
- * 'path' must start with 'root'. Sets up quota project IDs correctly.
+ * Creates and sets up an application-specific path on external
+ * storage with the correct ACL and project ID (if needed).
  *
  * ONLY for use with app-specific data directories on external storage!
  * (eg, /Android/data/com.foo, /Android/obb/com.foo, etc.)
  */
-int PrepareAppDirsFromRoot(std::string path, std::string root, mode_t mode, uid_t uid, gid_t gid);
+int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int appUid,
+                          bool fixupExisting);
 
 /* fs_prepare_dir wrapper that creates with SELinux context */
 status_t PrepareDir(const std::string& path, mode_t mode, uid_t uid, gid_t gid);
@@ -71,6 +69,9 @@ status_t ForceUnmount(const std::string& path);
 
 /* Kills any processes using given path */
 status_t KillProcessesUsingPath(const std::string& path);
+
+/* Kills any processes using given mount prifix */
+status_t KillProcessesWithMountPrefix(const std::string& path);
 
 /* Creates bind mount from source to target */
 status_t BindMount(const std::string& source, const std::string& target);
@@ -123,6 +124,7 @@ uint64_t GetFreeBytes(const std::string& path);
 uint64_t GetTreeBytes(const std::string& path);
 
 bool IsFilesystemSupported(const std::string& fsType);
+bool IsFuseDaemon(const pid_t pid);
 
 /* Wipes contents of block device at given path */
 status_t WipeBlockDevice(const std::string& path);
@@ -145,6 +147,8 @@ std::string BuildDataUserCePath(const std::string& volumeUuid, userid_t userid);
 std::string BuildDataUserDePath(const std::string& volumeUuid, userid_t userid);
 
 dev_t GetDevice(const std::string& path);
+
+status_t EnsureDirExists(const std::string& path, mode_t mode, uid_t uid, gid_t gid);
 
 status_t RestoreconRecursive(const std::string& path);
 

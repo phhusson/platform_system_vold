@@ -29,20 +29,38 @@
 #include <android-base/logging.h>
 #include <keyutils.h>
 
+#include <fscrypt_uapi.h>
 #include "KeyStorage.h"
 #include "Utils.h"
 
 namespace android {
 namespace vold {
 
-bool randomKey(KeyBuffer* key) {
-    *key = KeyBuffer(FSCRYPT_MAX_KEY_SIZE);
+const KeyGeneration neverGen() {
+    return KeyGeneration{0, false, false};
+}
+
+static bool randomKey(size_t size, KeyBuffer* key) {
+    *key = KeyBuffer(size);
     if (ReadRandomBytes(key->size(), key->data()) != 0) {
         // TODO status_t plays badly with PLOG, fix it.
         LOG(ERROR) << "Random read failed";
         return false;
     }
     return true;
+}
+
+bool generateStorageKey(const KeyGeneration& gen, KeyBuffer* key) {
+    if (!gen.allow_gen) return false;
+    if (gen.use_hw_wrapped_key) {
+        if (gen.keysize != FSCRYPT_MAX_KEY_SIZE) {
+            LOG(ERROR) << "Cannot generate a wrapped key " << gen.keysize << " bytes long";
+            return false;
+        }
+        return generateWrappedStorageKey(key);
+    } else {
+        return randomKey(gen.keysize, key);
+    }
 }
 
 // Return true if the kernel supports the ioctls to add/remove fscrypt keys
@@ -222,6 +240,7 @@ bool installKey(const std::string& mountpoint, const EncryptionOptions& options,
             return false;
     }
 
+    if (options.use_hw_wrapped_key) arg->flags |= FSCRYPT_ADD_KEY_FLAG_WRAPPED;
     // Provide the raw key.
     arg->raw_size = key.size();
     memcpy(arg->raw, key.data(), key.size());
@@ -306,19 +325,19 @@ bool evictKey(const std::string& mountpoint, const EncryptionPolicy& policy) {
     return true;
 }
 
-bool retrieveKey(bool create_if_absent, const KeyAuthentication& key_authentication,
-                 const std::string& key_path, const std::string& tmp_path, KeyBuffer* key,
-                 bool keepOld) {
+bool retrieveOrGenerateKey(const std::string& key_path, const std::string& tmp_path,
+                           const KeyAuthentication& key_authentication, const KeyGeneration& gen,
+                           KeyBuffer* key, bool keepOld) {
     if (pathExists(key_path)) {
         LOG(DEBUG) << "Key exists, using: " << key_path;
         if (!retrieveKey(key_path, key_authentication, key, keepOld)) return false;
     } else {
-        if (!create_if_absent) {
+        if (!gen.allow_gen) {
             LOG(ERROR) << "No key found in " << key_path;
             return false;
         }
         LOG(INFO) << "Creating new key in " << key_path;
-        if (!randomKey(key)) return false;
+        if (!generateStorageKey(gen, key)) return false;
         if (!storeKeyAtomically(key_path, tmp_path, key_authentication, *key)) return false;
     }
     return true;

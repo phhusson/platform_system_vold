@@ -54,7 +54,8 @@ interface IVold {
 
     void remountUid(int uid, int remountMode);
 
-    void setupAppDir(@utf8InCpp String path, @utf8InCpp String appDirRoot, int appUid);
+    void setupAppDir(@utf8InCpp String path, int appUid);
+    void fixupAppDir(@utf8InCpp String path, int appUid);
 
     @utf8InCpp String createObb(@utf8InCpp String sourcePath, @utf8InCpp String sourceKey,
                                 int ownerGid);
@@ -125,7 +126,7 @@ interface IVold {
 
     @utf8InCpp String createStubVolume(@utf8InCpp String sourcePath,
             @utf8InCpp String mountPath, @utf8InCpp String fsType,
-            @utf8InCpp String fsUuid, @utf8InCpp String fsLabel);
+            @utf8InCpp String fsUuid, @utf8InCpp String fsLabel, int flags);
     void destroyStubVolume(@utf8InCpp String volId);
 
     FileDescriptor openAppFuseFile(int uid, int mountId, int fileId, int flags);

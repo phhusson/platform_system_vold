@@ -63,7 +63,6 @@
 #include "VoldNativeService.h"
 #include "VoldUtil.h"
 #include "VolumeManager.h"
-#include "cryptfs.h"
 #include "fs/Ext4.h"
 #include "fs/Vfat.h"
 #include "model/EmulatedVolume.h"
@@ -81,9 +80,10 @@ using android::vold::BindMount;
 using android::vold::CreateDir;
 using android::vold::DeleteDirContents;
 using android::vold::DeleteDirContentsAndDir;
+using android::vold::EnsureDirExists;
 using android::vold::IsFilesystemSupported;
 using android::vold::PrepareAndroidDirs;
-using android::vold::PrepareAppDirsFromRoot;
+using android::vold::PrepareAppDirFromRoot;
 using android::vold::PrivateVolume;
 using android::vold::Symlink;
 using android::vold::Unlink;
@@ -105,6 +105,8 @@ static const unsigned int kMajorBlockMmc = 179;
 static const unsigned int kMajorBlockExperimentalMin = 240;
 static const unsigned int kMajorBlockExperimentalMax = 254;
 
+using ScanProcCallback = bool(*)(uid_t uid, pid_t pid, int nsFd, const char* name, void* params);
+
 VolumeManager* VolumeManager::sInstance = NULL;
 
 VolumeManager* VolumeManager::Instance() {
@@ -115,7 +117,7 @@ VolumeManager* VolumeManager::Instance() {
 VolumeManager::VolumeManager() {
     mDebug = false;
     mNextObbId = 0;
-    mNextStubVolumeId = 0;
+    mNextStubId = 0;
     // For security reasons, assume that a secure keyguard is
     // showing until we hear otherwise
     mSecureKeyguardShowing = true;
@@ -341,11 +343,6 @@ std::shared_ptr<android::vold::VolumeBase> VolumeManager::findVolume(const std::
             return vol;
         }
     }
-    for (const auto& vol : mStubVolumes) {
-        if (vol->getId() == id) {
-            return vol;
-        }
-    }
     for (const auto& vol : mObbVolumes) {
         if (vol->getId() == id) {
             return vol;
@@ -540,9 +537,9 @@ int VolumeManager::setPrimary(const std::shared_ptr<android::vold::VolumeBase>& 
 // TODO: Get rid of this guesswork altogether and instead exec a process
 // immediately after fork to do our bindding for us.
 static bool childProcess(const char* storageSource, const char* userSource, int nsFd,
-                         struct dirent* de) {
+                         const char* name) {
     if (setns(nsFd, CLONE_NEWNS) != 0) {
-        async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to setns for %s :%s", de->d_name,
+        async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to setns for %s :%s", name,
                               strerror(errno));
         return false;
     }
@@ -559,59 +556,82 @@ static bool childProcess(const char* storageSource, const char* userSource, int 
 
     if (TEMP_FAILURE_RETRY(mount(storageSource, "/storage", NULL, MS_BIND | MS_REC, NULL)) == -1) {
         async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to mount %s for %s :%s",
-                              storageSource, de->d_name, strerror(errno));
+                              storageSource, name, strerror(errno));
         return false;
     }
 
     if (TEMP_FAILURE_RETRY(mount(NULL, "/storage", NULL, MS_REC | MS_SLAVE, NULL)) == -1) {
         async_safe_format_log(ANDROID_LOG_ERROR, "vold",
-                              "Failed to set MS_SLAVE to /storage for %s :%s", de->d_name,
+                              "Failed to set MS_SLAVE to /storage for %s :%s", name,
                               strerror(errno));
         return false;
     }
 
     if (TEMP_FAILURE_RETRY(mount(userSource, "/storage/self", NULL, MS_BIND, NULL)) == -1) {
         async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to mount %s for %s :%s",
-                              userSource, de->d_name, strerror(errno));
+                              userSource, name, strerror(errno));
         return false;
     }
 
     return true;
 }
 
-int VolumeManager::remountUid(uid_t uid, int32_t mountMode) {
-    if (GetBoolProperty(android::vold::kPropFuse, false)) {
-        // TODO(135341433): Implement fuse specific logic.
-        return 0;
-    }
-    std::string mode;
+// Fork the process and remount storage
+bool forkAndRemountChild(uid_t uid, pid_t pid, int nsFd, const char* name, void* params) {
+    int32_t mountMode = *static_cast<int32_t*>(params);
+    std::string userSource;
+    std::string storageSource;
+    pid_t child;
+    // Need to fix these paths to account for when sdcardfs is gone
     switch (mountMode) {
         case VoldNativeService::REMOUNT_MODE_NONE:
-            mode = "none";
-            break;
+            return true;
         case VoldNativeService::REMOUNT_MODE_DEFAULT:
-            mode = "default";
+            storageSource = "/mnt/runtime/default";
             break;
         case VoldNativeService::REMOUNT_MODE_READ:
-            mode = "read";
+            storageSource = "/mnt/runtime/read";
             break;
         case VoldNativeService::REMOUNT_MODE_WRITE:
         case VoldNativeService::REMOUNT_MODE_LEGACY:
         case VoldNativeService::REMOUNT_MODE_INSTALLER:
-            mode = "write";
+            storageSource = "/mnt/runtime/write";
             break;
         case VoldNativeService::REMOUNT_MODE_FULL:
-            mode = "full";
+            storageSource = "/mnt/runtime/full";
             break;
         case VoldNativeService::REMOUNT_MODE_PASS_THROUGH:
-            mode = "pass_through";
-            break;
+            return true;
         default:
             PLOG(ERROR) << "Unknown mode " << std::to_string(mountMode);
-            return -1;
+            return false;
     }
-    LOG(DEBUG) << "Remounting " << uid << " as mode " << mode;
+    LOG(DEBUG) << "Remounting " << uid << " as " << storageSource;
 
+    // Fork a child to mount user-specific symlink helper into place
+    userSource = StringPrintf("/mnt/user/%d", multiuser_get_user_id(uid));
+    if (!(child = fork())) {
+        if (childProcess(storageSource.c_str(), userSource.c_str(), nsFd, name)) {
+            _exit(0);
+        } else {
+            _exit(1);
+        }
+    }
+
+    if (child == -1) {
+        PLOG(ERROR) << "Failed to fork";
+        return false;
+    } else {
+        TEMP_FAILURE_RETRY(waitpid(child, nullptr, 0));
+    }
+    return true;
+}
+
+// Helper function to scan all processes in /proc and call the callback if:
+// 1). pid belongs to an app process
+// 2). If input uid is 0 or it matches the process uid
+// 3). If userId is not -1 or userId matches the process userId
+bool scanProcProcesses(uid_t uid, userid_t userId, ScanProcCallback callback, void* params) {
     DIR* dir;
     struct dirent* de;
     std::string rootName;
@@ -619,24 +639,22 @@ int VolumeManager::remountUid(uid_t uid, int32_t mountMode) {
     int pidFd;
     int nsFd;
     struct stat sb;
-    pid_t child;
-    std::string userSource;
-    std::string storageSource;
 
     static bool apexUpdatable = android::sysprop::ApexProperties::updatable().value_or(false);
 
     if (!(dir = opendir("/proc"))) {
-        PLOG(ERROR) << "Failed to opendir";
-        return -1;
+        async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to opendir");
+        return false;
     }
 
     // Figure out root namespace to compare against below
     if (!android::vold::Readlinkat(dirfd(dir), "1/ns/mnt", &rootName)) {
-        PLOG(ERROR) << "Failed to read root namespace";
+        async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to read root namespace");
         closedir(dir);
-        return -1;
+        return false;
     }
 
+    async_safe_format_log(ANDROID_LOG_INFO, "vold", "Start scanning all processes");
     // Poke through all running PIDs look for apps running as UID
     while ((de = readdir(dir))) {
         pid_t pid;
@@ -651,21 +669,23 @@ int VolumeManager::remountUid(uid_t uid, int32_t mountMode) {
             goto next;
         }
         if (fstat(pidFd, &sb) != 0) {
-            PLOG(WARNING) << "Failed to stat " << de->d_name;
+            async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to stat %s", de->d_name);
             goto next;
         }
-        if (sb.st_uid != uid) {
+        if (uid != 0 && sb.st_uid != uid) {
+            goto next;
+        }
+        if (userId != static_cast<userid_t>(-1) && multiuser_get_user_id(sb.st_uid) != userId) {
             goto next;
         }
 
         // Matches so far, but refuse to touch if in root namespace
-        LOG(DEBUG) << "Found matching PID " << de->d_name;
         if (!android::vold::Readlinkat(pidFd, "ns/mnt", &pidName)) {
-            PLOG(WARNING) << "Failed to read namespace for " << de->d_name;
+            async_safe_format_log(ANDROID_LOG_ERROR, "vold",
+                    "Failed to read namespacefor %s", de->d_name);
             goto next;
         }
         if (rootName == pidName) {
-            LOG(WARNING) << "Skipping due to root namespace";
             goto next;
         }
 
@@ -680,11 +700,9 @@ int VolumeManager::remountUid(uid_t uid, int32_t mountMode) {
             // non-Java process whose UID is < AID_APP_START. (The UID condition
             // is required to not filter out child processes spawned by apps.)
             if (!android::vold::Readlinkat(pidFd, "exe", &exeName)) {
-                PLOG(WARNING) << "Failed to read exe name for " << de->d_name;
                 goto next;
             }
             if (!StartsWith(exeName, "/system/bin/app_process") && sb.st_uid < AID_APP_START) {
-                LOG(WARNING) << "Skipping due to native system process";
                 goto next;
             }
         }
@@ -693,39 +711,13 @@ int VolumeManager::remountUid(uid_t uid, int32_t mountMode) {
         // NOLINTNEXTLINE(android-cloexec-open): Deliberately not O_CLOEXEC
         nsFd = openat(pidFd, "ns/mnt", O_RDONLY);
         if (nsFd < 0) {
-            PLOG(WARNING) << "Failed to open namespace for " << de->d_name;
+            async_safe_format_log(ANDROID_LOG_ERROR, "vold",
+                    "Failed to open namespace for %s", de->d_name);
             goto next;
         }
 
-        if (mode == "default") {
-            storageSource = "/mnt/runtime/default";
-        } else if (mode == "read") {
-            storageSource = "/mnt/runtime/read";
-        } else if (mode == "write") {
-            storageSource = "/mnt/runtime/write";
-        } else if (mode == "full") {
-            storageSource = "/mnt/runtime/full";
-        } else {
-            // Sane default of no storage visible. No need to fork a child
-            // to remount uid.
-            goto next;
-        }
-
-        // Mount user-specific symlink helper into place
-        userSource = StringPrintf("/mnt/user/%d", multiuser_get_user_id(uid));
-        if (!(child = fork())) {
-            if (childProcess(storageSource.c_str(), userSource.c_str(), nsFd, de)) {
-                _exit(0);
-            } else {
-                _exit(1);
-            }
-        }
-
-        if (child == -1) {
-            PLOG(ERROR) << "Failed to fork";
-            goto next;
-        } else {
-            TEMP_FAILURE_RETRY(waitpid(child, nullptr, 0));
+        if (!callback(sb.st_uid, pid, nsFd, de->d_name, params)) {
+            async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed in callback");
         }
 
     next:
@@ -733,7 +725,202 @@ int VolumeManager::remountUid(uid_t uid, int32_t mountMode) {
         close(pidFd);
     }
     closedir(dir);
+    async_safe_format_log(ANDROID_LOG_INFO, "vold", "Finished scanning all processes");
+    return true;
+}
+
+int VolumeManager::remountUid(uid_t uid, int32_t mountMode) {
+    if (GetBoolProperty(android::vold::kPropFuse, false)) {
+        // TODO(135341433): Implement fuse specific logic.
+        return 0;
+    }
+    return scanProcProcesses(uid, static_cast<userid_t>(-1),
+            forkAndRemountChild, &mountMode) ? 0 : -1;
+}
+
+// Bind mount obb dir for an app if necessary.
+// How it works:
+// 1). Check if a pid is an app uid and not the FuseDaemon, if not then return.
+// 2). Get the mounts for that pid.
+// 3). If obb is already mounted then return, otherwise we need to mount obb for this pid.
+// 4). Get all packages and uid mounted for jit profile. These packages are all packages with
+// same uid or whitelisted apps.
+// 5a). If there's no package, it means it's not a process running app data isolation, so
+// just bind mount Android/obb dir.
+// 5b). Otherwise, for each package, create obb dir if it's not created and bind mount it.
+// TODO: Should we get some reliable data from system server instead of scanning /proc ?
+static bool bindMountAppObbDir(uid_t uid, pid_t pid, int nsFd, const char* name, void* params) {
+    if (uid < AID_APP_START || uid > AID_APP_END) {
+        return true;
+    }
+    if (android::vold::IsFuseDaemon(pid)) {
+        return true;
+    }
+    async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Start mounting obb for uid:%d, pid:%d", uid,
+                          pid);
+
+    userid_t userId = multiuser_get_user_id(uid);
+    if (setns(nsFd, CLONE_NEWNS) != 0) {
+        async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to setns %s", strerror(errno));
+        return false;
+    }
+
+    std::string profiles_path(StringPrintf("/data/misc/profiles/cur/%d/", userId));
+    // We search both .../obb and .../obb/$PKG paths here.
+    std::string obb_path(StringPrintf("/storage/emulated/%d/Android/obb", userId));
+    int profiles_path_len = profiles_path.length();
+    int obb_path_len = obb_path.length();
+
+    // TODO: Refactor the code as a util function so we can reuse the mount parsing code.
+    std::string mounts_file(StringPrintf("/proc/%d/mounts", pid));
+    auto fp = std::unique_ptr<FILE, int (*)(FILE*)>(
+            setmntent(mounts_file.c_str(), "r"), endmntent);
+    if (!fp) {
+        async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Error opening %s: %s",
+                              mounts_file.c_str(), strerror(errno));
+        return false;
+    }
+
+    // Check if obb directory is mounted, and get all packages of mounted app data directory.
+    bool obb_mounted = false;
+    std::vector<std::string> pkg_name_list;
+    mntent* mentry;
+    while ((mentry = getmntent(fp.get())) != nullptr) {
+        if (strncmp(mentry->mnt_dir, profiles_path.c_str(), profiles_path_len) == 0) {
+            pkg_name_list.push_back(std::string(mentry->mnt_dir + profiles_path_len));
+        }
+        if (strncmp(mentry->mnt_dir, obb_path.c_str(), obb_path_len) == 0) {
+            obb_mounted = true;
+        }
+    }
+
+    // Obb mounted in zygote already, so skip it
+    if (obb_mounted) {
+        return true;
+    }
+
+    // Ensure obb parent directory exists
+    std::string obbSource;
+    if (IsFilesystemSupported("sdcardfs")) {
+        obbSource = StringPrintf("/mnt/runtime/default/emulated/%d/Android/obb", userId);
+    } else {
+        obbSource = StringPrintf("/mnt/pass_through/%d/emulated/%d/Android/obb", userId, userId);
+    }
+    std::string obbTarget(StringPrintf("/storage/emulated/%d/Android/obb", userId));
+    auto status = EnsureDirExists(obbSource, 0771, AID_MEDIA_RW, AID_MEDIA_RW);
+    if (status != OK) {
+        async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to create dir %s %s",
+                              obbSource.c_str(), strerror(-status));
+        return false;
+    }
+
+    // It means app data isolation is not applied to this, so we can just bind the whole obb
+    // directory instead.
+    if (pkg_name_list.empty()) {
+        async_safe_format_log(ANDROID_LOG_INFO, "vold",
+                              "Bind mounting whole obb directory for pid %d", pid);
+        status = BindMount(obbSource, obbTarget);
+        if (status != OK) {
+            async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to mount %s %s %s",
+                                  obbSource.c_str(), obbTarget.c_str(), strerror(-status));
+            return false;
+        }
+        return true;
+    }
+
+    // Bind mount each app's obb directory
+    for (const auto& pkg_name : pkg_name_list) {
+        std::string appObbSource;
+        if (IsFilesystemSupported("sdcardfs")) {
+            appObbSource = StringPrintf("/mnt/runtime/default/emulated/%d/Android/obb/%s",
+                    userId, pkg_name.c_str());
+        } else {
+            appObbSource = StringPrintf("/mnt/pass_through/%d/emulated/%d/Android/obb/%s",
+                    userId, userId, pkg_name.c_str());
+        }
+        std::string appObbTarget(StringPrintf("/storage/emulated/%d/Android/obb/%s",
+                userId, pkg_name.c_str()));
+
+        status = EnsureDirExists(appObbSource, 0770, uid, AID_MEDIA_RW);
+        if (status != OK) {
+            async_safe_format_log(ANDROID_LOG_INFO, "vold", "Failed to ensure dir %s exists",
+                                  appObbSource.c_str());
+            continue;
+        }
+        async_safe_format_log(ANDROID_LOG_INFO, "vold",
+                              "Bind mounting app obb directory(%s) for pid %d", pkg_name.c_str(),
+                              pid);
+        status = BindMount(appObbSource, appObbTarget);
+        if (status != OK) {
+            async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to mount %s %s %s",
+                                  obbSource.c_str(), obbTarget.c_str(), strerror(-status));
+            continue;
+        }
+    }
+    return true;
+}
+
+int VolumeManager::remountAppObb(userid_t userId) {
+    if (!GetBoolProperty(android::vold::kPropFuse, false)) {
+        return 0;
+    }
+    LOG(INFO) << "Start remounting app obb";
+    pid_t child;
+    if (!(child = fork())) {
+        // Child process
+        if (daemon(0, 0) == -1) {
+            PLOG(FATAL) << "Cannot create daemon";
+        }
+        // TODO(149548518): Refactor the code so minimize the work after fork to prevent deadlock.
+        if (scanProcProcesses(0, userId, bindMountAppObbDir, nullptr)) {
+            // As some forked zygote processes may not setuid and recognized as an app yet, sleep
+            // 3s and try again to catch 'em all.
+            usleep(3 * 1000 * 1000);  // 3s
+            async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Retry remounting app obb");
+            scanProcProcesses(0, userId, bindMountAppObbDir, nullptr);
+            _exit(0);
+        } else {
+            _exit(1);
+        }
+    }
+    if (child == -1) {
+        PLOG(ERROR) << "Failed to fork";
+        return -1;
+    } else if (child == 0) {
+        // Parent
+        int stat_loc;
+        for (;;) {
+            if (waitpid(child, &stat_loc, 0) != -1 || errno != EINTR) {
+                break;
+            }
+        }
+    }
     return 0;
+}
+
+bool VolumeManager::updateFuseMountedProperty() {
+    if (mFuseMountedUsers.size() == 0) {
+        android::base::SetProperty("vold.fuse_running_users", "");
+        return true;
+    }
+    std::stringstream stream;
+    char const * sep = "";
+    for (const auto& userId : mFuseMountedUsers) {
+        stream << sep;
+        stream << userId;
+        sep = ", ";
+    }
+    return android::base::SetProperty("vold.fuse_running_users", stream.str());
+}
+
+bool VolumeManager::addFuseMountedUser(userid_t userId) {
+    mFuseMountedUsers.insert(userId);
+    return updateFuseMountedProperty();
+}
+
+bool VolumeManager::removeFuseMountedUser(userid_t userId) {
+    mFuseMountedUsers.erase(userId);
+    return updateFuseMountedProperty();
 }
 
 int VolumeManager::reset() {
@@ -751,6 +938,8 @@ int VolumeManager::reset() {
     updateVirtualDisk();
     mAddedUsers.clear();
     mStartedUsers.clear();
+    mFuseMountedUsers.clear();
+    updateFuseMountedProperty();
     return 0;
 }
 
@@ -768,9 +957,10 @@ int VolumeManager::shutdown() {
     }
 
     mInternalEmulatedVolumes.clear();
-    mStubVolumes.clear();
     mDisks.clear();
     mPendingDisks.clear();
+    mFuseMountedUsers.clear();
+    updateFuseMountedProperty();
     android::vold::sSleepOnUnmount = true;
     return 0;
 }
@@ -782,9 +972,6 @@ int VolumeManager::unmountAll() {
     // First, try gracefully unmounting all known devices
     for (const auto& vol : mInternalEmulatedVolumes) {
         vol->unmount();
-    }
-    for (const auto& stub : mStubVolumes) {
-        stub->unmount();
     }
     for (const auto& disk : mDisks) {
         disk->unmountAll();
@@ -824,31 +1011,7 @@ int VolumeManager::unmountAll() {
     return 0;
 }
 
-static gid_t getAppDirGid(const std::string& appDir) {
-    // Create app-specific dirs with the correct UID/GID
-    gid_t gid = AID_MEDIA_RW;
-    if (!IsFilesystemSupported("sdcardfs")) {
-        if (appDir == android::vold::kAppDataDir) {
-            gid = AID_EXT_DATA_RW;
-        } else if (appDir == android::vold::kAppObbDir) {
-            gid = AID_EXT_OBB_RW;
-        } else if (appDir == android::vold::kAppMediaDir) {
-            gid = AID_MEDIA_RW;
-        } else {
-            gid = AID_MEDIA_RW;
-        }
-    }
-
-    return gid;
-}
-
-static bool isValidAppDirRoot(const std::string& appDirRoot) {
-    return appDirRoot == android::vold::kAppDataDir || appDirRoot == android::vold::kAppMediaDir ||
-           appDirRoot == android::vold::kAppObbDir;
-}
-
-int VolumeManager::setupAppDir(const std::string& path, const std::string& appDirRoot,
-                               int32_t appUid) {
+int VolumeManager::setupAppDir(const std::string& path, int32_t appUid, bool fixupExistingOnly) {
     // Only offer to create directories for paths managed by vold
     if (!StartsWith(path, "/storage/")) {
         LOG(ERROR) << "Failed to find mounted volume for " << path;
@@ -890,28 +1053,24 @@ int VolumeManager::setupAppDir(const std::string& path, const std::string& appDi
     // on /storage/emulated/10 means /mnt/user/0/emulated/10
     const std::string lowerPath =
             volume->getInternalPath() + path.substr(volume->getPath().length());
-    const std::string lowerAppDirRoot =
-            volume->getInternalPath() + appDirRoot.substr(volume->getPath().length());
 
-    // Do some sanity checking on the app dir (relative from root)
     const std::string volumeRoot = volume->getRootPath();  // eg /data/media/0
 
-    // eg, if lowerAppDirRoot = /data/media/0/Android/data, this is /Android/data
-    const std::string relativeAppRoot = lowerAppDirRoot.substr(volumeRoot.length());
-    if (!isValidAppDirRoot(relativeAppRoot)) {
-        LOG(ERROR) << path << " is not a valid application directory.";
-        return -EINVAL;
+    if (fixupExistingOnly && (access(lowerPath.c_str(), F_OK) != 0)) {
+        // Nothing to fixup
+        return OK;
     }
 
-    // Make sure the Android/ directories exist and are setup correctly
-    int ret = PrepareAndroidDirs(volumeRoot);
-    if (ret != 0) {
-        LOG(ERROR) << "Failed to prepare Android/ directories.";
-        return ret;
-    }
+    // Create the app paths we need from the root
+    return PrepareAppDirFromRoot(lowerPath, volumeRoot, appUid, fixupExistingOnly);
+}
 
-    gid_t gid = getAppDirGid(relativeAppRoot);
-    return PrepareAppDirsFromRoot(lowerPath, lowerAppDirRoot, 0770, appUid, gid);
+int VolumeManager::fixupAppDir(const std::string& path, int32_t appUid) {
+    if (IsFilesystemSupported("sdcardfs")) {
+        //sdcardfs magically does this for us
+        return OK;
+    }
+    return setupAppDir(path, appUid, true /* fixupExistingOnly */);
 }
 
 int VolumeManager::createObb(const std::string& sourcePath, const std::string& sourceKey,
@@ -942,27 +1101,31 @@ int VolumeManager::destroyObb(const std::string& volId) {
 
 int VolumeManager::createStubVolume(const std::string& sourcePath, const std::string& mountPath,
                                     const std::string& fsType, const std::string& fsUuid,
-                                    const std::string& fsLabel, std::string* outVolId) {
-    int id = mNextStubVolumeId++;
-    auto vol = std::shared_ptr<android::vold::VolumeBase>(
-        new android::vold::StubVolume(id, sourcePath, mountPath, fsType, fsUuid, fsLabel));
-    vol->create();
+                                    const std::string& fsLabel, int32_t flags,
+                                    std::string* outVolId) {
+    dev_t stubId = --mNextStubId;
+    auto vol = std::shared_ptr<android::vold::StubVolume>(
+            new android::vold::StubVolume(stubId, sourcePath, mountPath, fsType, fsUuid, fsLabel));
 
-    mStubVolumes.push_back(vol);
+    int32_t passedFlags = android::vold::Disk::Flags::kStub;
+    passedFlags |= (flags & android::vold::Disk::Flags::kUsb);
+    passedFlags |= (flags & android::vold::Disk::Flags::kSd);
+    // StubDisk doesn't have device node corresponds to it. So, a fake device
+    // number is used.
+    auto disk = std::shared_ptr<android::vold::Disk>(
+            new android::vold::Disk("stub", stubId, "stub", passedFlags));
+    disk->initializePartition(vol);
+    handleDiskAdded(disk);
     *outVolId = vol->getId();
     return android::OK;
 }
 
 int VolumeManager::destroyStubVolume(const std::string& volId) {
-    auto i = mStubVolumes.begin();
-    while (i != mStubVolumes.end()) {
-        if ((*i)->getId() == volId) {
-            (*i)->destroy();
-            i = mStubVolumes.erase(i);
-        } else {
-            ++i;
-        }
-    }
+    auto tokens = android::base::Split(volId, ":");
+    CHECK(tokens.size() == 2);
+    dev_t stubId;
+    CHECK(android::base::ParseUint(tokens[1], &stubId));
+    handleDiskRemoved(stubId);
     return android::OK;
 }
 

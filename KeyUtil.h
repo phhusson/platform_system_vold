@@ -30,7 +30,20 @@ namespace vold {
 
 using namespace android::fscrypt;
 
-bool randomKey(KeyBuffer* key);
+// Description of how to generate a key when needed.
+struct KeyGeneration {
+    size_t keysize;
+    bool allow_gen;
+    bool use_hw_wrapped_key;
+};
+
+// Generate a key as specified in KeyGeneration
+bool generateStorageKey(const KeyGeneration& gen, KeyBuffer* key);
+
+// Returns a key with allow_gen false so generateStorageKey returns false;
+// this is used to indicate to retrieveOrGenerateKey that a key should not
+// be generated.
+const KeyGeneration neverGen();
 
 bool isFsKeyringSupported(void);
 
@@ -56,9 +69,9 @@ bool installKey(const std::string& mountpoint, const EncryptionOptions& options,
 // In the latter case, the caller is responsible for dropping caches.
 bool evictKey(const std::string& mountpoint, const EncryptionPolicy& policy);
 
-bool retrieveKey(bool create_if_absent, const KeyAuthentication& key_authentication,
-                 const std::string& key_path, const std::string& tmp_path, KeyBuffer* key,
-                 bool keepOld = true);
+bool retrieveOrGenerateKey(const std::string& key_path, const std::string& tmp_path,
+                           const KeyAuthentication& key_authentication, const KeyGeneration& gen,
+                           KeyBuffer* key, bool keepOld = true);
 
 }  // namespace vold
 }  // namespace android

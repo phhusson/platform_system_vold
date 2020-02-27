@@ -30,12 +30,14 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
+#include <android-base/strings.h>
 #include <android-base/unique_fd.h>
 #include <cutils/fs.h>
 #include <fs_mgr.h>
 #include <libdm/dm.h>
 
 #include "Checkpoint.h"
+#include "CryptoType.h"
 #include "EncryptInplace.h"
 #include "KeyStorage.h"
 #include "KeyUtil.h"
@@ -45,17 +47,54 @@
 
 #define TABLE_LOAD_RETRIES 10
 
+namespace android {
+namespace vold {
+
 using android::fs_mgr::FstabEntry;
 using android::fs_mgr::GetEntryForMountPoint;
 using android::vold::KeyBuffer;
 using namespace android::dm;
+
+// Parsed from metadata options
+struct CryptoOptions {
+    struct CryptoType cipher = invalid_crypto_type;
+    bool is_legacy = false;
+    bool set_dun = true;  // Non-legacy driver always sets DUN
+    bool use_hw_wrapped_key = false;
+};
 
 static const std::string kDmNameUserdata = "userdata";
 
 static const char* kFn_keymaster_key_blob = "keymaster_key_blob";
 static const char* kFn_keymaster_key_blob_upgraded = "keymaster_key_blob_upgraded";
 
+// The first entry in this table is the default crypto type.
+constexpr CryptoType supported_crypto_types[] = {aes_256_xts, adiantum};
+
+static_assert(validateSupportedCryptoTypes(64, supported_crypto_types,
+                                           array_length(supported_crypto_types)),
+              "We have a CryptoType which was incompletely constructed.");
+
+constexpr CryptoType legacy_aes_256_xts =
+        CryptoType().set_config_name("aes-256-xts").set_kernel_name("AES-256-XTS").set_keysize(64);
+
+static_assert(isValidCryptoType(64, legacy_aes_256_xts),
+              "We have a CryptoType which was incompletely constructed.");
+
+// Returns KeyGeneration suitable for key as described in CryptoOptions
+const KeyGeneration makeGen(const CryptoOptions& options) {
+    return KeyGeneration{options.cipher.get_keysize(), true, options.use_hw_wrapped_key};
+}
+
 static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device) {
+    // We're about to mount data not verified by verified boot.  Tell Keymaster that early boot has
+    // ended.
+    //
+    // TODO(paulcrowley): Make a Keymaster singleton or something, so we don't have to repeatedly
+    // open and initialize the service.
+    ::android::vold::Keymaster keymaster;
+    keymaster.earlyBootEnded();
+
     // fs_mgr_do_mount runs fsck. Use setexeccon to run trusted
     // partitions in the fsck domain.
     if (setexeccon(android::vold::sFsckContext)) {
@@ -76,9 +115,6 @@ static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device) {
     LOG(DEBUG) << "Mounted " << mount_point;
     return true;
 }
-
-namespace android {
-namespace vold {
 
 // Note: It is possible to orphan a key if it is removed before deleting
 // Update this once keymaster APIs change, and we have a proper commit.
@@ -105,12 +141,12 @@ static void commit_key(const std::string& dir) {
     LOG(INFO) << "Old Key deleted: " << dir;
 }
 
-static bool read_key(const FstabEntry& data_rec, bool create_if_absent, KeyBuffer* key) {
-    if (data_rec.metadata_key_dir.empty()) {
+static bool read_key(const std::string& metadata_key_dir, const KeyGeneration& gen,
+                     KeyBuffer* key) {
+    if (metadata_key_dir.empty()) {
         LOG(ERROR) << "Failed to get metadata_key_dir";
         return false;
     }
-    std::string metadata_key_dir = data_rec.metadata_key_dir;
     std::string sKey;
     auto dir = metadata_key_dir + "/key";
     LOG(DEBUG) << "metadata_key_dir/key: " << dir;
@@ -128,22 +164,17 @@ static bool read_key(const FstabEntry& data_rec, bool create_if_absent, KeyBuffe
     Keymaster keymaster;
     if (pathExists(newKeyPath)) {
         if (!android::base::ReadFileToString(newKeyPath, &sKey))
-            LOG(ERROR) << "Failed to read old key: " << dir;
+            LOG(ERROR) << "Failed to read incomplete key: " << dir;
         else if (!keymaster.deleteKey(sKey))
-            LOG(ERROR) << "Old key deletion failed, continuing anyway: " << dir;
+            LOG(ERROR) << "Incomplete key deletion failed, continuing anyway: " << dir;
         else
             unlink(newKeyPath.c_str());
     }
     bool needs_cp = cp_needsCheckpoint();
-    if (!android::vold::retrieveKey(create_if_absent, kEmptyAuthentication, dir, temp, key,
-                                    needs_cp))
-        return false;
+    if (!retrieveOrGenerateKey(dir, temp, kEmptyAuthentication, gen, key, needs_cp)) return false;
     if (needs_cp && pathExists(newKeyPath)) std::thread(commit_key, dir).detach();
     return true;
 }
-
-}  // namespace vold
-}  // namespace android
 
 static bool get_number_of_sectors(const std::string& real_blkdev, uint64_t* nr_sec) {
     if (android::vold::GetBlockDev512Sectors(real_blkdev, nr_sec) != android::OK) {
@@ -153,50 +184,39 @@ static bool get_number_of_sectors(const std::string& real_blkdev, uint64_t* nr_s
     return true;
 }
 
-static std::string lookup_cipher(const std::string& cipher_name, bool is_legacy) {
-    if (is_legacy) {
-        if (cipher_name.empty() || cipher_name == "aes-256-xts") {
-            return "AES-256-XTS";
+static bool create_crypto_blk_dev(const std::string& dm_name, const std::string& blk_device,
+                                  const KeyBuffer& key, const CryptoOptions& options,
+                                  std::string* crypto_blkdev, uint64_t* nr_sec) {
+    if (!get_number_of_sectors(blk_device, nr_sec)) return false;
+    // TODO(paulcrowley): don't hardcode that DmTargetDefaultKey uses 4096-byte
+    // sectors
+    *nr_sec &= ~7;
+
+    KeyBuffer module_key;
+    if (options.use_hw_wrapped_key) {
+        if (!exportWrappedStorageKey(key, &module_key)) {
+            LOG(ERROR) << "Failed to get ephemeral wrapped key";
+            return false;
         }
     } else {
-        if (cipher_name.empty() || cipher_name == "aes-256-xts") {
-            return "aes-xts-plain64";
-        } else if (cipher_name == "adiantum") {
-            return "xchacha12,aes-adiantum-plain64";
-        }
+        module_key = key;
     }
-    LOG(ERROR) << "No metadata cipher named " << cipher_name << " found, is_legacy=" << is_legacy;
-    return "";
-}
-
-static bool create_crypto_blk_dev(const std::string& dm_name, const FstabEntry* data_rec,
-                                  const KeyBuffer& key, std::string* crypto_blkdev) {
-    uint64_t nr_sec;
-    if (!get_number_of_sectors(data_rec->blk_device, &nr_sec)) return false;
-
-    bool is_legacy;
-    if (!DmTargetDefaultKey::IsLegacy(&is_legacy)) return false;
-
-    auto cipher = lookup_cipher(data_rec->metadata_cipher, is_legacy);
-    if (cipher.empty()) return false;
 
     KeyBuffer hex_key_buffer;
-    if (android::vold::StrToHex(key, hex_key_buffer) != android::OK) {
+    if (android::vold::StrToHex(module_key, hex_key_buffer) != android::OK) {
         LOG(ERROR) << "Failed to turn key to hex";
         return false;
     }
     std::string hex_key(hex_key_buffer.data(), hex_key_buffer.size());
 
-    // Non-legacy driver always sets DUN
-    bool set_dun = !is_legacy || android::base::GetBoolProperty("ro.crypto.set_dun", false);
-    if (!set_dun && data_rec->fs_mgr_flags.checkpoint_blk) {
-        LOG(ERROR) << "Block checkpoints and metadata encryption require ro.crypto.set_dun option";
-        return false;
-    }
+    auto target = std::make_unique<DmTargetDefaultKey>(0, *nr_sec, options.cipher.get_kernel_name(),
+                                                       hex_key, blk_device, 0);
+    if (options.is_legacy) target->SetIsLegacy();
+    if (options.set_dun) target->SetSetDun();
+    if (options.use_hw_wrapped_key) target->SetWrappedKeyV0();
 
     DmTable table;
-    table.Emplace<DmTargetDefaultKey>(0, nr_sec, cipher, hex_key, data_rec->blk_device, 0,
-                                      is_legacy, set_dun);
+    table.AddTarget(std::move(target));
 
     auto& dm = DeviceMapper::Instance();
     for (int i = 0;; i++) {
@@ -214,6 +234,40 @@ static bool create_crypto_blk_dev(const std::string& dm_name, const FstabEntry* 
     if (!dm.GetDmDevicePathByName(dm_name, crypto_blkdev)) {
         LOG(ERROR) << "Cannot retrieve default-key device status " << dm_name;
         return false;
+    }
+    return true;
+}
+
+static const CryptoType& lookup_cipher(const std::string& cipher_name) {
+    if (cipher_name.empty()) return supported_crypto_types[0];
+    for (size_t i = 0; i < array_length(supported_crypto_types); i++) {
+        if (cipher_name == supported_crypto_types[i].get_config_name()) {
+            return supported_crypto_types[i];
+        }
+    }
+    return invalid_crypto_type;
+}
+
+static bool parse_options(const std::string& options_string, CryptoOptions* options) {
+    auto parts = android::base::Split(options_string, ":");
+    if (parts.size() < 1 || parts.size() > 2) {
+        LOG(ERROR) << "Invalid metadata encryption option: " << options_string;
+        return false;
+    }
+    std::string cipher_name = parts[0];
+    options->cipher = lookup_cipher(cipher_name);
+    if (options->cipher.get_kernel_name() == nullptr) {
+        LOG(ERROR) << "No metadata cipher named " << cipher_name << " found";
+        return false;
+    }
+
+    if (parts.size() == 2) {
+        if (parts[1] == "wrappedkey_v0") {
+            options->use_hw_wrapped_key = true;
+        } else {
+            LOG(ERROR) << "Invalid metadata encryption flag: " << parts[1];
+            return false;
+        }
     }
     return true;
 }
@@ -237,16 +291,40 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
                    << data_rec->blk_device << " for " << mount_point;
         return false;
     }
+
+    bool is_legacy;
+    if (!DmTargetDefaultKey::IsLegacy(&is_legacy)) return false;
+
+    CryptoOptions options;
+    if (is_legacy) {
+        if (!data_rec->metadata_encryption.empty()) {
+            LOG(ERROR) << "metadata_encryption options cannot be set in legacy mode";
+            return false;
+        }
+        options.cipher = legacy_aes_256_xts;
+        options.is_legacy = true;
+        options.set_dun = android::base::GetBoolProperty("ro.crypto.set_dun", false);
+        if (!options.set_dun && data_rec->fs_mgr_flags.checkpoint_blk) {
+            LOG(ERROR)
+                    << "Block checkpoints and metadata encryption require ro.crypto.set_dun option";
+            return false;
+        }
+    } else {
+        if (!parse_options(data_rec->metadata_encryption, &options)) return false;
+    }
+
+    auto gen = needs_encrypt ? makeGen(options) : neverGen();
     KeyBuffer key;
-    if (!read_key(*data_rec, needs_encrypt, &key)) return false;
+    if (!read_key(data_rec->metadata_key_dir, gen, &key)) return false;
 
     std::string crypto_blkdev;
-    if (!create_crypto_blk_dev(kDmNameUserdata, data_rec, key, &crypto_blkdev)) return false;
+    uint64_t nr_sec;
+    if (!create_crypto_blk_dev(kDmNameUserdata, data_rec->blk_device, key, options, &crypto_blkdev,
+                               &nr_sec))
+        return false;
 
     // FIXME handle the corrupt case
     if (needs_encrypt) {
-        uint64_t nr_sec;
-        if (!get_number_of_sectors(data_rec->blk_device, &nr_sec)) return false;
         LOG(INFO) << "Beginning inplace encryption, nr_sec: " << nr_sec;
         off64_t size_already_done = 0;
         auto rc = cryptfs_enable_inplace(crypto_blkdev.data(), blk_device.data(), nr_sec,
@@ -266,3 +344,28 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
     mount_via_fs_mgr(data_rec->mount_point.c_str(), crypto_blkdev.c_str());
     return true;
 }
+
+static bool get_volume_options(CryptoOptions* options) {
+    return parse_options(android::base::GetProperty("ro.crypto.volume.metadata.encryption", ""),
+                         options);
+}
+
+bool defaultkey_volume_keygen(KeyGeneration* gen) {
+    CryptoOptions options;
+    if (!get_volume_options(&options)) return false;
+    *gen = makeGen(options);
+    return true;
+}
+
+bool defaultkey_setup_ext_volume(const std::string& label, const std::string& blk_device,
+                                 const KeyBuffer& key, std::string* out_crypto_blkdev) {
+    LOG(DEBUG) << "defaultkey_setup_ext_volume: " << label << " " << blk_device;
+
+    CryptoOptions options;
+    if (!get_volume_options(&options)) return false;
+    uint64_t nr_sec;
+    return create_crypto_blk_dev(label, blk_device, key, options, out_crypto_blkdev, &nr_sec);
+}
+
+}  // namespace vold
+}  // namespace android

@@ -65,8 +65,8 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
 
     binder::Status remountUid(int32_t uid, int32_t remountMode);
 
-    binder::Status setupAppDir(const std::string& path, const std::string& appDirRoot,
-                               int32_t appUid);
+    binder::Status setupAppDir(const std::string& path, int32_t appUid);
+    binder::Status fixupAppDir(const std::string& path, int32_t appUid);
 
     binder::Status createObb(const std::string& sourcePath, const std::string& sourceKey,
                              int32_t ownerGid, std::string* _aidl_return);
@@ -74,7 +74,8 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
 
     binder::Status createStubVolume(const std::string& sourcePath, const std::string& mountPath,
                                     const std::string& fsType, const std::string& fsUuid,
-                                    const std::string& fsLabel, std::string* _aidl_return);
+                                    const std::string& fsLabel, int32_t flags,
+                                    std::string* _aidl_return);
     binder::Status destroyStubVolume(const std::string& volId);
 
     binder::Status fstrim(int32_t fstrimFlags,
@@ -122,9 +123,9 @@ class VoldNativeService : public BinderService<VoldNativeService>, public os::Bn
                                  const std::string& secret);
     binder::Status lockUserKey(int32_t userId);
 
-    binder::Status prepareUserStorage(const std::unique_ptr<std::string>& uuid, int32_t userId,
+    binder::Status prepareUserStorage(const std::optional<std::string>& uuid, int32_t userId,
                                       int32_t userSerial, int32_t flags);
-    binder::Status destroyUserStorage(const std::unique_ptr<std::string>& uuid, int32_t userId,
+    binder::Status destroyUserStorage(const std::optional<std::string>& uuid, int32_t userId,
                                       int32_t flags);
 
     binder::Status prepareSandboxForApp(const std::string& packageName, int32_t appId,
