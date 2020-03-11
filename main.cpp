@@ -249,7 +249,7 @@ static int process_config(VolumeManager* vm, bool* has_adoptable, bool* has_quot
             std::string nickname(entry.label);
             int flags = 0;
 
-            if (entry.is_encryptable()) {
+            if (entry.is_encryptable() || true) {
                 flags |= android::vold::Disk::Flags::kAdoptable;
                 *has_adoptable = true;
             }
