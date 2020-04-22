@@ -947,7 +947,7 @@ int VolumeManager::unmountAll() {
              !StartsWith(test, "/mnt/scratch") &&
 #endif
              !StartsWith(test, "/mnt/vendor") && !StartsWith(test, "/mnt/product") &&
-             !StartsWith(test, "/mnt/installer")) ||
+             !StartsWith(test, "/mnt/installer") && !StartsWith(test, "/mnt/androidwritable")) ||
             StartsWith(test, "/storage/")) {
             toUnmount.push_front(test);
         }
@@ -1010,6 +1010,12 @@ int VolumeManager::setupAppDir(const std::string& path, int32_t appUid, bool fix
     if (fixupExistingOnly && (access(lowerPath.c_str(), F_OK) != 0)) {
         // Nothing to fixup
         return OK;
+    }
+
+    if (volume->getType() == VolumeBase::Type::kPublic) {
+        // On public volumes, we don't need to setup permissions, as everything goes through
+        // FUSE; just create the dirs and be done with it.
+        return fs_mkdirs(lowerPath.c_str(), 0700);
     }
 
     // Create the app paths we need from the root
