@@ -63,6 +63,7 @@ using android::base::EndsWith;
 using android::base::ReadFileToString;
 using android::base::StartsWith;
 using android::base::StringPrintf;
+using android::base::unique_fd;
 
 namespace android {
 namespace vold {
@@ -91,6 +92,10 @@ static const char* kMediaProviderAppCtx = "u:r:mediaprovider_app:";
 // Lock used to protect process-level SELinux changes from racing with each
 // other between multiple threads.
 static std::mutex kSecurityLock;
+
+std::string GetFuseMountPathForUser(userid_t user_id, const std::string& relative_upper_path) {
+    return StringPrintf("/mnt/user/%d/%s", user_id, relative_upper_path.c_str());
+}
 
 status_t CreateDeviceNode(const std::string& path, dev_t dev) {
     std::lock_guard<std::mutex> lock(kSecurityLock);
@@ -131,14 +136,15 @@ status_t DestroyDeviceNode(const std::string& path) {
 }
 
 // Sets a default ACL on the directory.
-int SetDefaultAcl(const std::string& path, mode_t mode, uid_t uid, gid_t gid) {
+int SetDefaultAcl(const std::string& path, mode_t mode, uid_t uid, gid_t gid,
+                  std::vector<gid_t> additionalGids) {
     if (IsSdcardfsUsed()) {
         // sdcardfs magically takes care of this
         return OK;
     }
 
-    static constexpr size_t size =
-            sizeof(posix_acl_xattr_header) + 3 * sizeof(posix_acl_xattr_entry);
+    size_t num_entries = 3 + (additionalGids.size() > 0 ? additionalGids.size() + 1 : 0);
+    size_t size = sizeof(posix_acl_xattr_header) + num_entries * sizeof(posix_acl_xattr_entry);
     auto buf = std::make_unique<uint8_t[]>(size);
 
     posix_acl_xattr_header* acl_header = reinterpret_cast<posix_acl_xattr_header*>(buf.get());
@@ -147,23 +153,41 @@ int SetDefaultAcl(const std::string& path, mode_t mode, uid_t uid, gid_t gid) {
     posix_acl_xattr_entry* entry =
             reinterpret_cast<posix_acl_xattr_entry*>(buf.get() + sizeof(posix_acl_xattr_header));
 
-    entry[0].e_tag = ACL_USER_OBJ;
+    int tag_index = 0;
+
+    entry[tag_index].e_tag = ACL_USER_OBJ;
     // The existing mode_t mask has the ACL in the lower 9 bits:
     // the lowest 3 for "other", the next 3 the group, the next 3 for the owner
     // Use the mode_t masks to get these bits out, and shift them to get the
     // correct value per entity.
     //
     // Eg if mode_t = 0700, rwx for the owner, then & S_IRWXU >> 6 results in 7
-    entry[0].e_perm = (mode & S_IRWXU) >> 6;
-    entry[0].e_id = uid;
+    entry[tag_index].e_perm = (mode & S_IRWXU) >> 6;
+    entry[tag_index].e_id = uid;
+    tag_index++;
 
-    entry[1].e_tag = ACL_GROUP_OBJ;
-    entry[1].e_perm = (mode & S_IRWXG) >> 3;
-    entry[1].e_id = gid;
+    entry[tag_index].e_tag = ACL_GROUP_OBJ;
+    entry[tag_index].e_perm = (mode & S_IRWXG) >> 3;
+    entry[tag_index].e_id = gid;
+    tag_index++;
 
-    entry[2].e_tag = ACL_OTHER;
-    entry[2].e_perm = mode & S_IRWXO;
-    entry[2].e_id = 0;
+    if (additionalGids.size() > 0) {
+        for (gid_t additional_gid : additionalGids) {
+            entry[tag_index].e_tag = ACL_GROUP;
+            entry[tag_index].e_perm = (mode & S_IRWXG) >> 3;
+            entry[tag_index].e_id = additional_gid;
+            tag_index++;
+        }
+
+        entry[tag_index].e_tag = ACL_MASK;
+        entry[tag_index].e_perm = (mode & S_IRWXG) >> 3;
+        entry[tag_index].e_id = 0;
+        tag_index++;
+    }
+
+    entry[tag_index].e_tag = ACL_OTHER;
+    entry[tag_index].e_perm = mode & S_IRWXO;
+    entry[tag_index].e_id = 0;
 
     int ret = setxattr(path.c_str(), XATTR_NAME_POSIX_ACL_DEFAULT, acl_header, size, 0);
 
@@ -287,6 +311,7 @@ int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int 
 
     uid_t uid = appUid;
     gid_t gid = AID_MEDIA_RW;
+    std::vector<gid_t> additionalGids;
     std::string appDir;
 
     // Check that the next part matches one of the allowed Android/ dirs
@@ -294,6 +319,10 @@ int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int 
         appDir = kAppDataDir;
         if (!sdcardfsSupport) {
             gid = AID_EXT_DATA_RW;
+            // Also add the app's own UID as a group; since apps belong to a group
+            // that matches their UID, this ensures that they will always have access to
+            // the files created in these dirs, even if they are created by other processes
+            additionalGids.push_back(uid);
         }
     } else if (StartsWith(pathFromRoot, kAppMediaDir)) {
         appDir = kAppMediaDir;
@@ -304,6 +333,8 @@ int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int 
         appDir = kAppObbDir;
         if (!sdcardfsSupport) {
             gid = AID_EXT_OBB_RW;
+            // See comments for kAppDataDir above
+            additionalGids.push_back(uid);
         }
     } else {
         LOG(ERROR) << "Invalid application directory: " << path;
@@ -364,7 +395,7 @@ int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int 
             // installers and MTP, that require access here.
             //
             // See man (5) acl for more details.
-            ret = SetDefaultAcl(pathToCreate, mode, uid, gid);
+            ret = SetDefaultAcl(pathToCreate, mode, uid, gid, additionalGids);
             if (ret != 0) {
                 return ret;
             }
@@ -1355,6 +1386,33 @@ status_t EnsureDirExists(const std::string& path, mode_t mode, uid_t uid, gid_t 
     return OK;
 }
 
+// Configures read ahead property of the fuse filesystem with the mount point |fuse_mount| by
+// writing |read_ahead_kb| to the /sys/class/bdi/MAJOR:MINOR/read_ahead_kb.
+void ConfigureReadAheadForFuse(const std::string& fuse_mount, size_t read_ahead_kb) {
+    LOG(INFO) << "Configuring read_ahead of " << fuse_mount << " fuse filesystem to "
+              << read_ahead_kb << "kb";
+    // First figure out MAJOR:MINOR of fuse_mount. Simplest way is to stat the path.
+    struct stat info;
+    if (stat(fuse_mount.c_str(), &info) != 0) {
+        PLOG(ERROR) << "Failed to stat " << fuse_mount;
+        return;
+    }
+    unsigned int maj = major(info.st_dev);
+    unsigned int min = minor(info.st_dev);
+    LOG(INFO) << fuse_mount << " has major:minor " << maj << ":" << min;
+    // We found major:minor of our filesystem, time to configure read ahead!
+    std::string read_ahead_file = StringPrintf("/sys/class/bdi/%u:%u/read_ahead_kb", maj, min);
+    unique_fd fd(TEMP_FAILURE_RETRY(open(read_ahead_file.c_str(), O_WRONLY | O_CLOEXEC)));
+    if (fd.get() == -1) {
+        PLOG(ERROR) << "Failed to open " << read_ahead_file;
+        return;
+    }
+    LOG(INFO) << "Writing " << read_ahead_kb << " to " << read_ahead_file;
+    if (!WriteStringToFd(std::to_string(read_ahead_kb), fd)) {
+        PLOG(ERROR) << "Failed to write to " << read_ahead_file;
+    }
+}
+
 status_t MountUserFuse(userid_t user_id, const std::string& absolute_lower_path,
                        const std::string& relative_upper_path, android::base::unique_fd* fuse_fd) {
     std::string pre_fuse_path(StringPrintf("/mnt/user/%d", user_id));
@@ -1522,7 +1580,7 @@ status_t PrepareAndroidDirs(const std::string& volumeRoot) {
     // Some other apps, like installers, have write access to the OBB directory
     // to pre-download them. To make sure newly created folders in this directory
     // have the right permissions, set a default ACL.
-    SetDefaultAcl(androidObbDir, mode, AID_MEDIA_RW, obbGid);
+    SetDefaultAcl(androidObbDir, mode, AID_MEDIA_RW, obbGid, {});
 
     if (fs_prepare_dir(androidMediaDir.c_str(), mode, AID_MEDIA_RW, AID_MEDIA_RW) != 0) {
         PLOG(ERROR) << "Failed to create " << androidMediaDir;
