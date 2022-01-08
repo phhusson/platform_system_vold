@@ -52,14 +52,19 @@ static bool randomKey(size_t size, KeyBuffer* key) {
 }
 
 bool generateStorageKey(const KeyGeneration& gen, KeyBuffer* key) {
-    if (!gen.allow_gen) return false;
+    if (!gen.allow_gen) {
+    	LOG(ERROR) << "Generating storage key not allowed";
+    	return false;
+    	}
     if (gen.use_hw_wrapped_key) {
         if (gen.keysize != FSCRYPT_MAX_KEY_SIZE) {
             LOG(ERROR) << "Cannot generate a wrapped key " << gen.keysize << " bytes long";
             return false;
         }
+        LOG(DEBUG) << "Generating wrapped storage key";
         return generateWrappedStorageKey(key);
     } else {
+    	LOG(DEBUG) << "Generating standard storage key";
         return randomKey(gen.keysize, key);
     }
 }
